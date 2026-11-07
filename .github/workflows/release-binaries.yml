@@ -613,35 +613,22 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Downloaded by name, the artifact (the bin folder) is extracted straight into `path`. A
+      # pattern matching one artifact did the same into artifacts/, and the loop that expected a
+      # folder per artifact zipped only the Qt plugin subfolders (build-3 had no lichii.exe).
       - name: Download binaries
         uses: actions/download-artifact@v7
         with:
-          pattern: lichii-*-${{ github.sha }}
-          path: artifacts
+          name: lichii-windows-x86_64-pgo-${{ github.sha }}
+          path: bin
 
       - name: Package release files
         shell: bash
         run: |
           set -euo pipefail
+          test -f bin/lichii.exe
           mkdir dist
-          # Asset names drop the commit sha: the release tag already identifies the build, and
-          # stable names let the notes table link to them.
-          strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          for artifact in artifacts/*/; do
-            name=$(basename "$artifact")
-            if compgen -G "$artifact*.AppImage" > /dev/null; then
-              # Linux: ship the AppImage and the tar.gz as they are.
-              for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
-                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            elif compgen -G "$artifact*.zip" > /dev/null; then
-              for file in "$artifact"*.zip "$artifact"*.dmg; do
-                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
-            fi
-          done
+          (cd bin && zip -qr "${GITHUB_WORKSPACE}/dist/lichii-windows-x86_64-pgo.zip" .)
           ls -la dist
 
       - name: Create release
