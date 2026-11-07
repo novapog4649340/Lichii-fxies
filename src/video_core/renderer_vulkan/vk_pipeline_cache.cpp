@@ -1168,28 +1168,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                      error ? fmt::format(" (failed: {})", error.message()) : std::string{});
         }
     }
-    // zortos293/Lichii builds from #194 on (cache version 53) write the same records as this
-    // build under another version number: with no cache of this version, copy theirs and
-    // relabel the copy. Their files stay as they are.
-    if (std::error_code error; !std::filesystem::exists(pipeline_cache_filename, error)) {
-        constexpr u32 ZortosCacheVersion = 53;
-        constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-        const auto zortos = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan",
-                                                                    ZortosCacheVersion);
-        if (VideoCommon::CopyCompatiblePipelineCache(zortos, pipeline_cache_filename,
-                                                     PipelineCacheMagic, ZortosCacheVersion,
-                                                     CACHE_VERSION)) {
-            LOG_INFO(Render_Vulkan, "Copied cache version {} pipeline cache {} to {}",
-                     ZortosCacheVersion, Common::FS::PathToUTF8String(zortos),
-                     Common::FS::PathToUTF8String(pipeline_cache_filename));
-            const auto zortos_used = VideoCommon::VersionedPipelineCachePath(
-                base_dir, "vulkan_used", ZortosCacheVersion);
-            if (!std::filesystem::exists(used_pipelines_filename, error) &&
-                std::filesystem::exists(zortos_used, error)) {
-                std::filesystem::copy_file(zortos_used, used_pipelines_filename, error);
-            }
-        }
-    }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
