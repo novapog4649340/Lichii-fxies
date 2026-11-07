@@ -18,7 +18,6 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -114,12 +113,10 @@ public:
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
-    bool HasCachedReports(DAddr addr, u64 size) override;
+    bool HasCachedQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
-    /// The GPU's own cached writes: invalidates the caches that ever registered objects on their
-    /// pages (the buffer cache always).
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
@@ -160,14 +157,9 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history = true) override;
-    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override {
-        return &oot_network_bypass;
-    }
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
-    void AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
-                                      std::span<const u8> memory);
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
 
@@ -181,9 +173,6 @@ public:
                                                             u32 pixel_stride);
 
 private:
-    /// False when no page of the range was ever written by the GPU through the buffer cache.
-    bool MayBeGpuModified(DAddr addr, u64 size);
-
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2
@@ -195,19 +184,12 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
-    /// Binds the pipeline, buffers and render targets of the current draw, then records it with
-    /// `draw_func`; skips the draw when its pipeline is unavailable.
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
-    bool IsNx2IndirectReset(bool is_indexed, u32 instance_count);
-    /// A compute dispatch was recorded since the last barrier for GPU-counted draws.
-    bool compute_since_count_barrier{};
-    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
-    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -216,7 +198,7 @@ private:
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
-    void SubmitNx2ListCopies(u64 writer);
+    void SubmitNx2ListCopies();
 
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
@@ -247,7 +229,6 @@ private:
     void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    bool alpha_to_coverage_enable{}; ///< Last value recorded with SetAlphaToCoverageEnableEXT
     void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -259,10 +240,10 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
-    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
-    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
+    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -304,7 +285,6 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
-    VideoCommon::OotNetwork::BypassState oot_network_bypass;
 
     struct IndirectTrace {
         vk::Buffer readback;

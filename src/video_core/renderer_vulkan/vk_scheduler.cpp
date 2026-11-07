@@ -25,7 +25,6 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
-#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -46,17 +45,22 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+std::map<std::string, u64> g_profile_flushes;
 
-void CountRenderPassEnd(const char* file, u32 line) {
+void CountSite(std::map<std::string, u64>& sites, const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
     }
     std::string_view name{file};
-    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
+    if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
         name.remove_prefix(slash + 1);
     }
     std::scoped_lock lock{g_profile_end_mutex};
-    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+    ++sites[fmt::format("{}:{}", name, line)];
+}
+
+void CountRenderPassEnd(const char* file, u32 line) {
+    CountSite(g_profile_ends, file, line);
 }
 
 void ReportSubmitCounts() {
@@ -78,19 +82,23 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
-    std::vector<std::pair<u64, std::string>> ends;
-    {
-        std::scoped_lock lock{g_profile_end_mutex};
-        for (const auto& [site, count] : g_profile_ends) {
-            ends.emplace_back(count, site);
+    const auto report = [seconds](std::map<std::string, u64>& sites, const char* what) {
+        std::vector<std::pair<u64, std::string>> sorted;
+        {
+            std::scoped_lock lock{g_profile_end_mutex};
+            for (const auto& [site, count] : sites) {
+                sorted.emplace_back(count, site);
+            }
+            sites.clear();
         }
-        g_profile_ends.clear();
-    }
-    std::sort(ends.rbegin(), ends.rend());
-    for (size_t i = 0; i < ends.size() && i < 16; ++i) {
-        LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
-                 static_cast<double>(ends[i].first) / seconds, ends[i].second);
-    }
+        std::sort(sorted.rbegin(), sorted.rend());
+        for (size_t i = 0; i < sorted.size() && i < 16; ++i) {
+            LOG_INFO(Render_Vulkan, "{} {:.0f}/s at {}", what,
+                     static_cast<double>(sorted[i].first) / seconds, sorted[i].second);
+        }
+    };
+    report(g_profile_ends, "Render pass ends");
+    report(g_profile_flushes, "Submits");
 }
 }
 
@@ -115,6 +123,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
 
     if (Common::DkbFrameTrace::Enabled()) {
+        vk::CmdTrace::g_on = true;
         const auto physical = device.GetPhysical();
         trace_timestamp_bits =
             physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
@@ -166,6 +175,8 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    CountSite(g_profile_flushes, flush_pending ? "deferred" : location.file_name(),
+              flush_pending ? 0 : location.line());
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -191,10 +202,7 @@ bool Scheduler::DeferFlush() {
         if (value != nullptr) {
             return static_cast<s64>(std::atoll(value));
         }
-        // 0 by default (EvilOOT's flash fix): Ocarina of Time flashed white with the 500 us batch
-        // (sword boulder with preflush: 31 whole-screen flashes in 30 s, 0 without), and ran
-        // faster without it (Lake Hylia 52.3 -> 55.4 fps). EDEN_NX2_FENCE_FLUSH_US=500 restores it.
-        return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ? s64{5000} : s64{0};
+        return s64{500};
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
@@ -226,17 +234,9 @@ bool Scheduler::WaitSubmitted(u64 tick) {
         }
         if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
             next_log = now + std::chrono::seconds{2};
-            // The back serves the request between entries: one that never does is blocked in
-            // an entry. Name the wait when it is a tracked one (BackWaitScope).
-            const char* const back_site = VideoCommon::back_wait_site.load(std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan,
-                        "Waited {} s for the GPU thread to submit tick {} (submitted up to {}); "
-                        "GPU back thread blocked in: {}",
+            LOG_WARNING(Render_Vulkan, "Waited {} s for the GPU thread to submit tick {}",
                         std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
-                        tick, master_semaphore->CurrentTick() - 1,
-                        back_site != nullptr ? back_site
-                                             : "no tracked wait (an untracked lock or wait, or "
-                                               "a long entry)");
+                        tick);
             split.RequestIdleHook();
         }
         if (spins < 64) {
@@ -552,8 +552,6 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            Common::Nx2Timeline::Span timeline_span{has_submit ? "record commands + submit"
-                                                               : "record commands"};
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
@@ -660,6 +658,70 @@ void Scheduler::ReportWorkTimes() {
     };
     std::map<std::pair<u64, u64>, Totals> by_shaders;
     double total_ms{};
+    // GPU time between one timed item's end and the next one's start in the same submission:
+    // what was recorded between them (barriers, render pass ends and loads, copies, queries).
+    const auto shader_name = [](const WorkTrace& item) {
+        return item.fragment_hash == 0 ? fmt::format("s6:{:016x}", item.hash)
+                                       : fmt::format("s5:{:016x}", item.fragment_hash);
+    };
+    double gap_ms{};
+    u32 gaps{};
+    std::map<std::string, std::pair<double, u32>> gaps_before;
+    std::map<std::string, std::pair<double, u32>> gaps_by_ops;
+    for (u32 i = 1; i < count; ++i) {
+        const WorkTrace& previous = trace_work_items[i - 1];
+        const WorkTrace& item = trace_work_items[i];
+        if (previous.submission != item.submission || results[i * 2 - 1].available == 0 ||
+            results[i * 2].available == 0) {
+            continue;
+        }
+        const double ms = static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
+                              results[i * 2 - 1].timestamp, results[i * 2].timestamp,
+                              trace_timestamp_bits)) *
+                          trace_timestamp_period / 1e6;
+        if (ms < 0.0 || ms > 1000.0) {
+            continue;
+        }
+        gap_ms += ms;
+        ++gaps;
+        auto& before = gaps_before[shader_name(item)];
+        before.first += ms;
+        ++before.second;
+        std::string ops;
+        for (u32 op = 0; op < vk::CmdTrace::Count; ++op) {
+            if (item.ops_before[op] != 0) {
+                ops += fmt::format("{}{}{}", ops.empty() ? "" : "+", vk::CmdTrace::op_names[op],
+                                   item.ops_before[op]);
+            }
+        }
+        auto& by_ops = gaps_by_ops[ops.empty() ? "none" : ops];
+        by_ops.first += ms;
+        ++by_ops.second;
+    }
+    std::vector<std::pair<double, std::string>> slow_gaps;
+    for (const auto& [name, totals] : gaps_before) {
+        slow_gaps.emplace_back(totals.first, fmt::format("{}={:.3f}ms/{}x", name, totals.first,
+                                                         totals.second));
+    }
+    std::ranges::sort(slow_gaps, std::greater<>{});
+    std::string gap_text;
+    for (size_t i = 0; i < slow_gaps.size() && i < 8; ++i) {
+        gap_text += ' ' + slow_gaps[i].second;
+    }
+    LOG_INFO(Render_Vulkan, "DKB gpu_gaps renderer_frame={} gaps={} gap_sum_ms={:.3f} before:{}",
+             trace_sample_frame, gaps, gap_ms, gap_text);
+    std::vector<std::pair<double, std::string>> op_gaps;
+    for (const auto& [ops, totals] : gaps_by_ops) {
+        op_gaps.emplace_back(totals.first,
+                             fmt::format("{}={:.3f}ms/{}x", ops, totals.first, totals.second));
+    }
+    std::ranges::sort(op_gaps, std::greater<>{});
+    std::string op_text;
+    for (size_t i = 0; i < op_gaps.size() && i < 12; ++i) {
+        op_text += ' ' + op_gaps[i].second;
+    }
+    LOG_INFO(Render_Vulkan, "DKB gpu_gap_ops renderer_frame={} by commands between:{}",
+             trace_sample_frame, op_text);
     for (u32 i = 0; i < count; ++i) {
         if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
             continue;

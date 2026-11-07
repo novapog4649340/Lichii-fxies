@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -90,6 +92,10 @@ Id GuestLane(EmitContext& ctx, Id index) {
     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
 }
 
+// Fragment shaders on AMD's proprietary driver lower absolute and relative shuffles through the
+// broadcast loop Qualcomm already uses: amdvlk64 crashes in vkCreateGraphicsPipelines on some
+// Ocarina of Time fragment shaders, and Djihads80/Eglantine#618 reduced that crash to
+// OpGroupNonUniformShuffle.
 bool UseShuffleFallback(EmitContext& ctx) {
     return ctx.profile.has_broken_spirv_subgroup_shuffle ||
            (ctx.profile.has_broken_spirv_fragment_shuffle && ctx.stage == Stage::Fragment);

@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -13,6 +15,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -33,6 +36,17 @@
 #include "shader_recompiler/exception.h"
 
 namespace Vulkan {
+
+namespace {
+// Experiment: EDEN_NX2_COMPUTE_WAVE32=1 runs every compute shader at the guest warp size.
+bool ForceComputeWave32() {
+    static const bool forced = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPUTE_WAVE32");
+        return value != nullptr && value[0] == '1';
+    }();
+    return forced || Device::WarpExact();
+}
+} // Anonymous namespace
 
 using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
@@ -205,11 +219,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 bool skip_until_built_)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, skip_until_built{skip_until_built_},
+      spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -256,7 +272,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
         const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
-                                   info.uses_quad_shuffles || info.uses_fswzadd;
+                                   info.uses_quad_shuffles || info.uses_fswzadd ||
+                                   ForceComputeWave32();
         VkPipelineCreateFlags flags{};
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
@@ -287,11 +304,24 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
+        const auto build_start = std::chrono::steady_clock::now();
+        const auto build_seconds = [&] {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - build_start)
+                .count();
+        };
         try {
+            const std::array<u64, 1> traced{shader_hash};
+            const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
+            const auto trace_begin = std::chrono::steady_clock::now();
+            TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
+                               std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - trace_begin)
+                                   .count());
         } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
-                         exception.what());
+            LOG_CRITICAL(Render_Vulkan, "Driver rejected compute shader {:016X} after {:.1f} s: {}",
+                         shader_hash, build_seconds(), exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -308,6 +338,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             );
         }
 
+        if (skip_until_built) {
+            LOG_INFO(Render_Vulkan, "Deferred compute shader {:016X} built in {:.1f} s",
+                     shader_hash, build_seconds());
+        }
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
@@ -350,6 +384,20 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 TextureCacheRuntime& texture_runtime,
                                 std::optional<ByteAddressedShadow>& shadow) {
     shadow.reset();
+    if (skip_until_built && (!is_built.load(std::memory_order::acquire) || !pipeline)) {
+        if (!kepler_compute.IsNativeMode()) {
+            return false;
+        }
+        if (!is_built.load(std::memory_order::acquire)) {
+            throw Shader::RuntimeError(
+                "Compute shader {:016X} is still being built by the driver; its dispatches are "
+                "skipped until it is ready",
+                shader_hash);
+        }
+        throw Shader::RuntimeError(
+            "The driver failed to build compute shader {:016X}; its dispatches are skipped",
+            shader_hash);
+    }
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
@@ -358,7 +406,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written, desc.indirect_offset);
+                                              desc.is_written, desc.indirect_offset,
+
+                                              desc.write_extent);
         ++ssbo_index;
     }
 
@@ -373,7 +423,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
-            static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
             return TexturePair(VideoCommon::EvaluateTextureHandle(
                                    info, desc.handle_program, gpu_memory,
                                    [&](u32 cbuf) -> GPUVAddr {
@@ -383,7 +432,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                                   ? cbufs[cbuf].Address()
                                                   : GPUVAddr{};
                                    },
-                                   align_storage ? device.GetStorageBufferAlignment() : 1),
+                                   device.GetStorageBufferAlignment()),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
@@ -397,12 +446,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const u32 secondary_offset{desc.secondary_cbuf_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
-                const u32 lhs_raw{gpu_memory.ReadHandleWord(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.ReadHandleWord(separate_addr) << desc.secondary_shift_left};
+                const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
+                const u32 rhs_raw{gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left};
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
-        return TexturePair(gpu_memory.ReadHandleWord(addr), via_header_index);
+        return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -447,11 +496,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    static const bool record_sampled = [] {
-        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-        return value && *value != '\0' && *value != '0';
-    }();
-    if (record_sampled) {
+    if (RecordingSampledTextures()) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);

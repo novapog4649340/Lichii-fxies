@@ -156,6 +156,10 @@ public:
     std::array<u64, NUM_STAGES> written_storage_buffers{};
     u64 enabled_compute_storage_buffers = 0;
     u64 written_compute_storage_buffers = 0;
+    // Bound by a native (Switch 2) compute program, whose pointers carry no size.
+    u64 native_compute_storage_buffers = 0;
+    // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -182,6 +186,7 @@ public:
 
 template <class P>
 class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo> {
+    friend struct BufferCacheTestAccess;
     // Page size for caching purposes.
     // This is unrelated to the CPU page size and it can be changed as it seems optimal.
 #ifdef YUZU_LEGACY
@@ -237,7 +242,8 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               u64 write_mark_limit = ~u64{0});
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
@@ -266,10 +272,16 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
-    /// DownloadMemory for each range, waiting for the GPU once.
-    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
-
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// The core consumed the read traps of these pages for a read the texture cache answered:
+    /// the next GPU write here must arm them again (GetFlushArea forgets them otherwise).
+    void ForgetReadTraps(DAddr device_addr, u64 size) {
+        read_trapped_ranges.Subtract(
+            Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE),
+            Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE) -
+                Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE));
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -310,8 +322,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written, u32 indirect_offset = ~0U);
+                                  bool is_written, u32 indirect_offset = ~0U,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -369,8 +383,7 @@ public:
         }
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
-    /// `writer`: the dispatch's shader hash, 0 for a DMA copy (EDEN_NX2_LIST_WAIT_TRACE).
-    bool Nx2CopyListPages(u64 tick, u64 writer = 0);
+    bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
@@ -380,9 +393,7 @@ public:
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
-    /// The split's back, the front waiting on it: downloads `pages` and every page draws wrote
-    /// since it was last flushed with one GPU wait, and notes the latter synced. Each page's next
-    /// lists then read guest memory instead of draining and flushing one page at a time.
+
     void Nx2FlushListPages(std::span<const DAddr> pages);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
@@ -392,7 +403,7 @@ public:
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
-    /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
+    /// host buffer holding each range, if one does, for diagnostics. Nothing is
     /// created or synchronized. Stage 5 is compute.
     template <typename Func>
     void ForEachBoundBuffer(bool compute, Func&& func) {
@@ -468,8 +479,15 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
-    /// Indirectly read banks of native programs already uploaded this frame.
-    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// The guest words of each page of native programs' indirectly read banks when last checked:
+    /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
+    /// per page).
+    struct NativePageSnapshot {
+        std::array<u8, Core::DEVICE_PAGESIZE> bytes;
+        /// Tegra::g_nx2_guest_sync_epoch when compared last: unchanged since if still current.
+        u64 epoch{};
+    };
+    std::unordered_map<DAddr, NativePageSnapshot> native_indirect_page_snapshots;
 
 private:
     template <typename Mask, typename Func>
@@ -680,27 +698,32 @@ private:
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
 
-    /// Experiment, EDEN_NX2_WRITTEN_SSBO_MARK_KIB=<n>: marks at most n KiB of a written Switch 2
-    /// storage buffer binding GPU-written. Native pointers carry no size, so a written binding
-    /// spans up to 8 MiB of its mapping and arms read traps and fence downloads over CPU data
-    /// the shader never writes. Writes past the cap are not tracked, so this only measures how
-    /// much of the marked range the GPU really writes.
-    u32 WrittenStorageMarkSize(u32 size) const {
-        static const u64 cap = [] {
-            const char* value = std::getenv("EDEN_NX2_WRITTEN_SSBO_MARK_KIB");
-            return value == nullptr ? u64{0} : std::strtoull(value, nullptr, 10) * 1024;
-        }();
-        if (cap == 0 || gpu_memory == nullptr || !gpu_memory->UsesNativeTiling()) {
-            return size;
-        }
-        return static_cast<u32>((std::min<u64>)(size, cap));
-    }
-
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
     bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
         return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+    }
+
+    /// Whether the range holds GPU-written data that no fence downloads (not Preflushable).
+    bool HasGpuWritesNotDownloadedAtFence(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            return false;
+        }
+        bool found = false;
+        memory_tracker.ForEachDownloadRange(device_addr, size, false, [&](u64 start, u64 range_size) {
+            if (found) {
+                return;
+            }
+            u64 covered = 0;
+            memory_tracker.ForEachPreflushableRange(start, range_size, [&](u64 lower, u64 length) {
+                const u64 begin = (std::max)(lower, start);
+                const u64 end = (std::min)(lower + length, start + range_size);
+                covered += end > begin ? end - begin : 0;
+            });
+            found = covered < range_size;
+        });
+        return found;
     }
 
     /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
@@ -715,15 +738,12 @@ private:
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
-        // Preflushed writes arm the read traps too: their data reaches guest memory only when
-        // the fence's download lands, and a read before that saw stale words (Ocarina of Time's
-        // whole screen flashed white at the sword boulder, ~180 times in 30 s). The trapped read
-        // flushes on demand only while the data is still in flight (GetFlushArea).
         if (!exact) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            } else {
+                ArmReadTraps(device_addr, size);
             }
-            ArmReadTraps(device_addr, size);
             return;
         }
         const DAddr end = device_addr + size;
@@ -736,7 +756,9 @@ private:
                 queued += upper - lower;
             }
         });
-        ArmReadTraps(device_addr, size);
+        if (queued < size) {
+            ArmReadTraps(device_addr, size);
+        }
         if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
             Nx2DownloadTrace::Queued(device_addr, size, queued);
         }
@@ -747,10 +769,11 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        if (!read_trapped_ranges.Arm(begin, end - begin)) {
-            return;
-        }
-        device_memory.ArmReadTraps(begin, end - begin);
+        // Only the parts not armed yet: the core visits each page it is given, and a buffer the
+        // GPU rewrites every frame is mostly still armed (the guest read a few of its pages).
+        read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+            device_memory.ArmReadTraps(part, part_size);
+        });
     }
 
     ReadTrapTracker read_trapped_ranges;
@@ -813,7 +836,6 @@ private:
         u64 synced_writes{~u64{0}};
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
-        u64 copy_writer{}; ///< What recorded the copy (Nx2CopyListPages)
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
         /// once: the front can't tell from what it sent which draws write the page, so it reads
         /// no copy. A draw's writes reach a pushbuffer fetch only after a host-level wait, so

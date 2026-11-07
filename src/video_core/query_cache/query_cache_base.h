@@ -90,12 +90,16 @@ public:
         return mask;
     }
 
-    /// Whether a report in the region is still listed (pending host results, or written and not
-    /// unregistered yet). Only the cache mutex: callable from the split front.
-    [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
-        bool result = false;
-        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
-        return result;
+    /// Whether the cache still holds a report in the region (written out or not). Any thread: it
+    /// only takes the cache's lock. A report writes up to 16 bytes from its address.
+    [[nodiscard]] bool HasCachedQueries(VAddr addr, size_t size) {
+        bool found = false;
+        const VAddr begin = addr >= 12 ? addr - 12 : 0;
+        IterateCache<false>(begin, size + (addr - begin), [&found](QueryLocation) {
+            found = true;
+            return true;
+        });
+        return found;
     }
 
     /// Return true when a CPU region is modified from the GPU
@@ -114,8 +118,6 @@ public:
 
     void CounterClose(QueryType counter_type);
 
-    /// Queues a query report (a counter value or the payload, with a timestamp when flagged) to
-    /// be written at `addr`.
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 

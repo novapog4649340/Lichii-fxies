@@ -165,11 +165,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
-    INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
-           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
-              "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution).\nTakes effect "
-              "when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -256,6 +251,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Controls the DMA read mode.\nUnsafe is faster, while Safe is more stable and can fix issues in some games.\nDefault follows the GPU Accuracy setting."));
     INSERT(Settings, gpu_fence_behavior, tr("GPU Fence Behavior:"),
            tr("Controls the GPU fence synchronization behavior.\nImmediate is the fastest option, but can introduce some issues.\nBalanced offers better compatibility and may fix issues in some games.\nAccurate further improves compatibility at the cost of some performance.\nDefault follows the GPU Mode setting."));
+    INSERT(Settings, native_compute_write_mark, tr("Native compute write mark:"),
+           tr("How much of a Switch 2 compute shader's storage buffer is treated as written by "
+              "the GPU after each dispatch.\nAuto marks what the shader's stores can reach and "
+              "falls back to Full when that cannot be proven.\nFull marks the whole binding (up to "
+              "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
+              "(flickering effects) and copy far more data back from the GPU.\n64 KiB cap marks at "
+              "most 64 KiB, which can miss data a large dispatch really wrote."));
     INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
            tr("May reduce shader stutter."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
@@ -277,6 +279,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Determines the number of depth slices processed in a single dispatch.\n"
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
+    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores (experimental)"),
+           tr("Pins the emulator's GPU threads to dedicated physical CPU cores and keeps the "
+              "emulated CPU cores off them.\n"
+              "Can hurt performance on CPUs with few cores. Skipped on CPUs with fewer than 6 "
+              "physical performance cores.\n"
+              "Windows only. Takes effect when a game starts."));
 
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
@@ -293,9 +301,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
            tr("Run the game at normal speed during video playback, even when the framerate is "
               "unlocked."));
-    INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
-           tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
-              "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
@@ -465,6 +470,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DmaAccuracy, Unsafe, tr("Unsafe (fast)")),
                               PAIR(DmaAccuracy, Safe, tr("Safe (stable)")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::NativeComputeWriteMark>::Index(),
+                          {
+                              PAIR(NativeComputeWriteMark, Auto, tr("Auto (shader extent)")),
+                              PAIR(NativeComputeWriteMark, Full, tr("Full binding")),
+                              PAIR(NativeComputeWriteMark, Cap64K, tr("64 KiB cap")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
                           {
                               PAIR(GpuFenceBehavior, Default, tr("Default")),
@@ -543,11 +554,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(AntiAliasing, None, tr("None")),
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
-                          }});
-    translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
-                          {
-                              PAIR(OotAntiAliasing, Game, tr("Game")),
-                              PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

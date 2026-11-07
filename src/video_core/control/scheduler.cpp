@@ -12,6 +12,7 @@
 #include "core/core.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 
@@ -21,12 +22,10 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(
-            [this, gpu_ptr = &gpu, bind_id] {
-                std::scoped_lock lk{scheduling_guard};
-                gpu_ptr->BindChannel(bind_id);
-            },
-            VideoCommon::GpuSplit::Effect::None);
+        split.Defer([this, gpu_ptr = &gpu, bind_id] {
+            std::scoped_lock lk{scheduling_guard};
+            gpu_ptr->BindChannel(bind_id);
+        });
         return;
     }
     std::scoped_lock lk{scheduling_guard};
@@ -34,6 +33,7 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
 }
 
 void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
+    Tegra::Nx2BumpGuestSyncEpoch();
     std::shared_ptr<ChannelState> channel_state;
     {
         std::unique_lock lk(scheduling_guard);

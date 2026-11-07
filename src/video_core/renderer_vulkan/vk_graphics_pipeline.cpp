@@ -8,15 +8,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <set>
 #include <span>
-#include <unordered_set>
-#include <unordered_map>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -49,84 +47,9 @@
 
 namespace Vulkan {
 namespace {
-// EDEN_NX2_DRAW_REUSE_PROBE=1: how often a draw's setup (pipeline, texture handles and samplers,
-// constant buffer addresses, vertex streams, render targets) repeats, from frame to frame and
-// from the previous draw of the same pipeline: whether caching it can pay. Logged every 120 frames.
-struct DrawReuseProbe {
-    static bool Enabled() {
-        static const bool enabled = std::getenv("EDEN_NX2_DRAW_REUSE_PROBE") != nullptr;
-        return enabled;
-    }
-    static DrawReuseProbe& Get() {
-        static DrawReuseProbe probe;
-        return probe;
-    }
-    static u64 Mix(u64 hash, u64 value) {
-        hash ^= value + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
-        return hash;
-    }
-    static u64 Bytes(u64 hash, const void* data, size_t size) {
-        const auto* bytes = static_cast<const u8*>(data);
-        for (size_t i = 0; i + 8 <= size; i += 8) {
-            u64 word;
-            std::memcpy(&word, bytes + i, 8);
-            hash = Mix(hash, word);
-        }
-        return hash;
-    }
-    void Note(const void* pipeline, u64 full, u64 textures, u64 no_cbufs) {
-        ++draws;
-        no_cbufs_seen += last_no_cbufs.contains(no_cbufs) ? 1 : 0;
-        auto& previous_no_cbufs = previous_no_cbufs_by_pipeline[pipeline];
-        no_cbufs_same_previous += previous_no_cbufs == no_cbufs ? 1 : 0;
-        previous_no_cbufs = no_cbufs;
-        this_no_cbufs.insert(no_cbufs);
-        full_seen += last_full.contains(full) ? 1 : 0;
-        textures_seen += last_textures.contains(textures) ? 1 : 0;
-        auto& previous = previous_by_pipeline[pipeline];
-        full_same_previous += previous.first == full ? 1 : 0;
-        textures_same_previous += previous.second == textures ? 1 : 0;
-        previous = {full, textures};
-        this_full.insert(full);
-        this_textures.insert(textures);
-    }
-    void Frame() {
-        std::swap(last_full, this_full);
-        std::swap(last_textures, this_textures);
-        std::swap(last_no_cbufs, this_no_cbufs);
-        this_full.clear();
-        this_textures.clear();
-        this_no_cbufs.clear();
-        if (++frames < 120) {
-            return;
-        }
-        const auto pct = [this](u64 n) { return draws ? 100.0 * static_cast<double>(n) / static_cast<double>(draws) : 0.0; };
-        LOG_INFO(Render_Vulkan,
-                 "Draw reuse probe: {:.0f} draws/frame; setup seen last frame {:.1f}%, textures seen "
-                 "last frame {:.1f}%; same as the pipeline's previous draw: setup {:.1f}%, textures "
-                 "{:.1f}%; without constant buffer addresses: seen last frame {:.1f}%, same as "
-                 "previous {:.1f}%",
-                 static_cast<double>(draws) / frames, pct(full_seen), pct(textures_seen),
-                 pct(full_same_previous), pct(textures_same_previous), pct(no_cbufs_seen),
-                 pct(no_cbufs_same_previous));
-        frames = draws = full_seen = textures_seen = full_same_previous = textures_same_previous = 0;
-        no_cbufs_seen = no_cbufs_same_previous = 0;
-    }
-    std::unordered_set<u64> last_full, this_full, last_textures, this_textures;
-    std::unordered_map<const void*, std::pair<u64, u64>> previous_by_pipeline;
-    std::unordered_set<u64> last_no_cbufs, this_no_cbufs;
-    std::unordered_map<const void*, u64> previous_no_cbufs_by_pipeline;
-    u64 no_cbufs_seen{}, no_cbufs_same_previous{};
-    u64 frames{}, draws{}, full_seen{}, textures_seen{}, full_same_previous{},
-        textures_same_previous{};
-};
-
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
-using Shader::Backend::SPIRV::MESH_DRAW_BASE_OFFSET;
-using Shader::Backend::SPIRV::MeshDrawBaseLayout;
-using Shader::Backend::SPIRV::MeshFirstEnabled;
 using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
@@ -345,12 +268,6 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 } // Anonymous namespace
 
-void NoteDrawReuseProbeFrame() {
-    if (DrawReuseProbe::Enabled()) [[unlikely]] {
-        DrawReuseProbe::Get().Frame();
-    }
-}
-
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
 }
@@ -494,7 +411,6 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    zero_texture_handles = 0;
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -527,34 +443,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                const auto evaluate{[&](u64 storage_alignment) {
-                    return VideoCommon::EvaluateTextureHandle(
-                        info, desc.handle_program, *gpu_memory,
-                        [&](u32 cbuf) -> GPUVAddr {
-                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
-                                                                              : GPUVAddr{};
-                        },
-                        storage_alignment);
-                }};
-                // The program's storage offsets are relative to the buffer address aligned down
-                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=1 reads
-                // the words there instead of at the unaligned address.
-                static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
-                const u64 storage_alignment{device.GetStorageBufferAlignment()};
-                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
-                if (raw == 0) {
-                    ++zero_texture_handles;
-                    static std::set<std::pair<u64, u32>> logged;
-                    const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
-                    if (logged.size() < 64 && logged.insert(key_program).second) {
-                        LOG_INFO(Render_Vulkan,
-                                 "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
-                                 "aligned to {} it gives {:#x}, unaligned {:#x}",
-                                 desc.handle_program, stage, key_program.first, storage_alignment,
-                                 evaluate(storage_alignment), evaluate(1));
-                    }
-                }
-                return TexturePair(raw, via_header_index);
+                return TexturePair(VideoCommon::EvaluateTextureHandle(
+                                       info, desc.handle_program, *gpu_memory,
+                                       [&](u32 cbuf) -> GPUVAddr {
+                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
+                                                      ? cbufs[cbuf].address
+                                                      : GPUVAddr{};
+                                       },
+                                       device.GetStorageBufferAlignment()),
+                                   via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
@@ -567,14 +464,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
+                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
+                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
+            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -638,32 +535,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
-    if (DrawReuseProbe::Enabled()) [[unlikely]] {
-        u64 textures = 0;
-        for (const auto& view : views) {
-            textures = DrawReuseProbe::Mix(textures, view.index);
-        }
-        for (const auto sampler : samplers) {
-            textures = DrawReuseProbe::Mix(textures, sampler.index);
-        }
-        u64 full = DrawReuseProbe::Mix(textures, reinterpret_cast<u64>(this));
-        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-            for (const auto& cbuf : maxwell3d->state.shader_stages[stage].const_buffers) {
-                full = DrawReuseProbe::Mix(full, cbuf.enabled ? cbuf.address ^ (u64{cbuf.size} << 48) : 0);
-            }
-        }
-        full = DrawReuseProbe::Bytes(full, &regs.vertex_streams, sizeof(regs.vertex_streams));
-        full = DrawReuseProbe::Bytes(full, &regs.rt, sizeof(regs.rt));
-        u64 no_cbufs = DrawReuseProbe::Mix(textures, reinterpret_cast<u64>(this));
-        no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.vertex_streams, sizeof(regs.vertex_streams));
-        no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.rt, sizeof(regs.rt));
-        DrawReuseProbe::Get().Note(this, full, textures, no_cbufs);
-    }
-    static const bool record_sampled = [] {
-        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-        return value && *value != '\0' && *value != '0';
-    }();
-    if (record_sampled) {
+    if (RecordingSampledTextures()) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};
@@ -888,7 +760,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            build->Wait(!worker_only_build);
+            // Claim the build here even for worker-only builds: the queue is FIFO, so a held
+            // draw otherwise waits behind every pipeline queued before it (title 1: 1-2 s).
+            build->Wait(true);
             hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - begin)
                                        .count(),
@@ -898,12 +772,6 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
-    const bool push_mesh_draw_base{IsMeshPipeline() && MeshFirstEnabled()};
-    MeshDrawBaseLayout mesh_draw_base{};
-    if (push_mesh_draw_base) {
-        const u32 first{maxwell3d->draw_manager.draw_state.vertex_buffer.first};
-        (stage_infos[0].is_task ? mesh_draw_base.task : mesh_draw_base.mesh) = first;
-    }
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
         scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
@@ -930,8 +798,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words, push_mesh_draw_base,
-                      mesh_draw_base](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -960,10 +827,6 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (uses_render_area) {
             cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                  sizeof(render_area_data), &render_area_data);
-        }
-        if (push_mesh_draw_base) {
-            cmdbuf.PushConstants(*pipeline_layout, push_stages, MESH_DRAW_BASE_OFFSET,
-                                 sizeof(mesh_draw_base), &mesh_draw_base);
         }
         if (!descriptor_set_layout) {
             return;
@@ -1405,6 +1268,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
+    const auto trace_begin = std::chrono::steady_clock::now();
+    TracePipelineBuild("BEGIN", "graphics", key.Hash(), key.unique_hashes, unoptimized);
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -1426,6 +1292,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    TracePipelineBuild("END", "graphics", key.Hash(), key.unique_hashes, unoptimized,
+                       std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - trace_begin)
+                           .count());
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

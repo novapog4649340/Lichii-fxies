@@ -311,9 +311,6 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
-    Id mesh_draw_base_push_constant{};
-    u32 mesh_draw_base_member_index{};
-
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -433,16 +430,11 @@ private:
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
-    /// Defines the helpers global memory accesses call: each finds the storage buffer holding
-    /// the address and loads, writes or atomically updates it there.
     void DefineGlobalMemoryFunctions(const IR::Program& program);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
-    void DefineMeshDrawBase();
-    [[nodiscard]] bool UsesMeshDrawBase() const;
-    [[nodiscard]] u32 MeshDrawBaseOffset() const;
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);

@@ -127,7 +127,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     // Periodic statistics (TickFrame).
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
-    u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_download_deletes{}; ///< Evictions that downloaded the image first
+    u64 gc_download_waits{};   ///< GPU waits those downloads took
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -139,20 +140,21 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_expected_memory{};
     u64 budget_check_frames{};
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
+    u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
-    std::vector<u8> astc_scan_buffer;
+    Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
-    /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
+    /// The most device memory the collector lets the cache fill before it collects in earnest on
+    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
@@ -390,7 +392,7 @@ private:
     void OnGPUASRegister(size_t map_id) final override;
 
     /// Runs the Garbage Collector.
-    void RunGarbageCollector();
+    void RunGarbageCollector(bool out_of_memory);
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

@@ -296,10 +296,6 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
-        kepler_compute->BypassOotNetwork(program_id, shader->lowered_native->native_program_key)) {
-        throw FireEmblemUpscale::DispatchReplaced{};
-    }
-    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
@@ -326,9 +322,7 @@ void ShaderCache::RememberRejection(VAddr addr) {
         return;
     }
     rejected_native.emplace(addr, std::current_exception());
-    // InnerInvalidation only reaches InvalidateRegions on marked pages, and a rejection can
-    // outlive (or precede) the registration that marked its page.
-    page_filter.Mark(addr, 1);
+    page_filter.Mark(addr, 1); // InnerInvalidation reaches InvalidatePagesInRegion for it
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),

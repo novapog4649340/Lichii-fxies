@@ -23,7 +23,6 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
-#include "video_core/gpu_wait_site.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_profile.h"
@@ -82,18 +81,7 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
-        // at each command list end): read once, every decision of this fence uses one value.
-        const bool level_high = Settings::IsGPULevelHigh();
-        // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
-        // fence runs its operation at once, before the host GPU has run the work the report
-        // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
-        // at low GPU accuracy).
-        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
-                                 (Settings::IsGPUFenceBehaviorDefault()
-                                      ? level_high
-                                      : Settings::IsGPUFenceBehaviorBalanced() ||
-                                            Settings::IsGPUFenceBehaviorAccurate());
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -133,10 +121,6 @@ public:
             cv.notify_all();
         }
         if (delay_fence) {
-            // Its callback runs on the fencing thread once the fence's work is done, and the
-            // guest or WaitPendingFences may block on that callback: a submission left for
-            // later (Scheduler::DeferFlush) would wait for the back to go idle, which it then
-            // never does (GPU accuracy switched to High while the game ran, 24 s and more).
             SubmitDeferredWork();
         }
         rasterizer.InvalidateGPUCache();
@@ -175,7 +159,6 @@ public:
             // submits. The fencing thread waits for that submission before releasing the fence,
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
             SubmitDeferredWork();
-            BackWaitScope wait_scope{"FenceManager::WaitPendingFences (fencing thread callback)"};
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });

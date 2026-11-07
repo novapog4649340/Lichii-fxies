@@ -20,7 +20,6 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
-#include "common/nx2_timeline.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -77,16 +76,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "writer wait", "list submit wait", "list GPU wait",
 };
 
-// Read once, when the GPU thread starts (Initialize): Enabled() runs several times per method
-// write (no guard to check). Not at static initialization: nx2_switches.txt is only applied in
-// main(). Off while EDEN_NX2_SAMPLE_PROFILE samples (common/nx2_sample_profile.h): the zone timers
-// would show up in the samples.
-inline bool g_enabled = false;
-
-inline void Initialize() {
-    g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr &&
-                std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr;
-}
+// Read once at startup: Enabled() runs several times per method write (no guard to check).
+inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 
 inline bool Enabled() {
     return g_enabled;
@@ -98,29 +89,6 @@ inline u64 Now() {
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
-/// What a front macro memory read (MME DMA) had to wait for: the newest unexecuted writer.
-enum class DmaWaitCause : u32 {
-    ComputeCopy,       ///< Compute or copy work
-    HostSync,          ///< The work before a host-level wait
-    ConstBufferUpload, ///< A 3D constant buffer upload (const_buffer.buffer)
-    InlineUpload,      ///< 3D inline data
-    Macro3D,           ///< A 3D macro register
-    Report,            ///< A 3D report (report_semaphore.query)
-    DmaLaunch,         ///< 3D launch_dma
-    SyncInfo,          ///< 3D sync_info
-    WaitForIdle,       ///< 3D wait_for_idle
-    Other3D,           ///< Another memory-writing 3D method
-    OtherEngine,       ///< A compute, DMA, inline-to-memory or 2D engine method
-    Deferred,          ///< Puller semaphore releases and maps
-    AvoidedByRange,    ///< Not waited: the pending writes' ranges miss the read (RangeLastWrite)
-    Count,
-};
-
-inline constexpr std::array<const char*, static_cast<size_t>(DmaWaitCause::Count)>
-    dma_wait_cause_names{"compute/copy",  "host sync",    "cbuf upload", "inline upload",
-                         "3D macro",      "report",       "dma launch",  "sync info",
-                         "wait for idle", "other 3D",     "other engine", "deferred",
-                         "avoided (range)"};
 // What the zones and drain waits measure in: the time stamp counter without the fences the wall
 // clock reads it with (those fences cost ~10% of the GPU back thread with ~45,000 draws a
 // second). Report converts it with the wall clock.
@@ -135,8 +103,7 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
-    std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
+    std::array<u64, 8> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -147,40 +114,9 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
-/// The zones a timeline records without detail: waits, whole draws, dispatches and macros.
-[[nodiscard]] constexpr bool IsCoarse(Zone zone) {
-    switch (zone) {
-    case Zone::Idle:
-    case Zone::PendingSleep:
-    case Zone::ResumePending:
-    case Zone::Push:
-    case Zone::Macro:
-    case Zone::Draw:
-    case Zone::Clear:
-    case Zone::Compute:
-    case Zone::FlushWork:
-    case Zone::TextureUpload:
-    case Zone::Fence:
-    case Zone::SplitDrain:
-    case Zone::SplitWait:
-    case Zone::WriterWait:
-    case Zone::ListSubmitWait:
-    case Zone::ListGpuWait:
-        return true;
-    default:
-        return false;
-    }
-}
-
 class Scope {
 public:
-    explicit Scope(Zone zone_)
-        : zone{zone_}, enabled{Enabled()},
-          timeline{Common::Nx2Timeline::Active() &&
-                   (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
-        if (timeline) {
-            timeline_start = Common::Nx2Timeline::Now();
-        }
+    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
         if (!enabled) {
             return;
         }
@@ -190,10 +126,6 @@ public:
     }
 
     ~Scope() {
-        if (timeline) {
-            Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
-                                        Common::Nx2Timeline::Now());
-        }
         if (!enabled) {
             return;
         }
@@ -211,10 +143,8 @@ public:
 private:
     Zone zone;
     bool enabled;
-    bool timeline;
     u64 start{};
     u64 parent_child_ns{};
-    u64 timeline_start{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -227,33 +157,7 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
-    AcquiresFast,   ///< EDEN_NX2_ACQUIRE_PRECHECK: acquires met without draining the split
-    AcquiresQueued, ///< Acquires met by a release still queued for the split's back
-    PtrCacheHits,   ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page pointer cached
-    PtrCacheMisses, ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page looked up
-    UboInPlaceSame, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers unchanged, nothing copied
-    UboInPlaceChanged, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers changed, copied once
-    AcquireNoRelease,  ///< Drained acquires: no release of the word was sent this session
-    AcquireReleaseRan, ///< Drained acquires: the last release of the word already ran on the back
-    AcquireLaterWrite, ///< Drained acquires: work sent after its release may write the word
-    AcquirePayloadMiss, ///< Drained acquires: the queued release's payload does not meet it
-    AcquireMetAfterDrain, ///< Drained acquires met at once after the drain
-    DmaReadsForwarded, ///< MME DMA reads served from a queued constant buffer upload
-    DmaReadsEarly,  ///< MME DMA reads without a drain (Maxwell3D::FrontDmaReadEarly)
-    DmaReadsWaitUnknown, ///< Of those, waited for a write the front can't place
-    DmaReadsWaitGpu,     ///< waited for all queued GPU work with unknown destinations
-    DmaReadsWaitWrite,   ///< waited for a noted write to the words' pages
-    AcquirePolls,   ///< Polls of a waiting acquire (Puller::CanResumeAcquire)
-    AcquirePollsFast, ///< Of AcquirePolls: answered from the word without draining the back
-    SemNoFastPath,    ///< SemaphoreReadableNow false: split off or EDEN_NX2_SEM_FAST=0
-    SemGpuWrittenPage, ///< SemaphoreReadableNow false: the word's page is marked GPU-written
-    SemAsyncPending,  ///< SemaphoreReadableNow false: a counter report or timed release is pending
-    SemWritersWait,   ///< SemaphoreReadableNow false: WaitForWritesTo gave up
-    AcquireNoDrain,   ///< Acquires of a current word not met yet that registered without a drain
-    Count,
 };
-static_assert(static_cast<size_t>(Counter::Count) <= 64, "Counter outgrew the counters array");
-static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
 /// same-value writes among them; MME DMA reads by the macro that made them. The most frequent
@@ -322,12 +226,6 @@ inline void AddDrain(DrainSite site, u64 start) {
     }
 }
 
-inline void AddDmaWaitCause(DmaWaitCause cause) {
-    if (Enabled()) {
-        ++t_data.dma_wait_causes[static_cast<size_t>(cause)];
-    }
-}
-
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
 /// the totals every 10 s.
 inline void Report(const char* thread_name = "GPU thread") {
@@ -378,72 +276,6 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
-    if (const u64 queued = data.counters[static_cast<size_t>(Counter::AcquiresQueued)]; queued != 0) {
-        line += fmt::format(" | acquires met by a queued release {:.0f}",
-                            static_cast<double>(queued) * 1e9 / window);
-    }
-    {
-        const auto rate = [&](Counter counter) {
-            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
-        };
-        if (data.counters[static_cast<size_t>(Counter::AcquireChecks)] != 0) {
-            line += fmt::format(" | drained acquires: no release {:.0f}, release ran {:.0f}, "
-                                "later write {:.0f}, payload miss {:.0f}, met after drain {:.0f}",
-                                rate(Counter::AcquireNoRelease), rate(Counter::AcquireReleaseRan),
-                                rate(Counter::AcquireLaterWrite),
-                                rate(Counter::AcquirePayloadMiss),
-                                rate(Counter::AcquireMetAfterDrain));
-        }
-    }
-    if (const u64 forwarded = data.counters[static_cast<size_t>(Counter::DmaReadsForwarded)];
-        forwarded != 0) {
-        line += fmt::format(" | MME DMA reads from queued uploads {:.0f}",
-                            static_cast<double>(forwarded) * 1e9 / window);
-    }
-    if (const u64 fast = data.counters[static_cast<size_t>(Counter::AcquiresFast)]; fast != 0) {
-        line += fmt::format(" | acquires without a drain {:.0f}",
-                            static_cast<double>(fast) * 1e9 / window);
-    }
-    if (const u64 hits = data.counters[static_cast<size_t>(Counter::PtrCacheHits)],
-        misses = data.counters[static_cast<size_t>(Counter::PtrCacheMisses)];
-        hits != 0 || misses != 0) {
-        line += fmt::format(" | handle page pointers {:.0f} cached, {:.0f} looked up",
-                            static_cast<double>(hits) * 1e9 / window,
-                            static_cast<double>(misses) * 1e9 / window);
-    }
-    if (const u64 same = data.counters[static_cast<size_t>(Counter::UboInPlaceSame)],
-        changed = data.counters[static_cast<size_t>(Counter::UboInPlaceChanged)];
-        same != 0 || changed != 0) {
-        line += fmt::format(" | uniform buffers compared in place {:.0f} unchanged, {:.0f} changed",
-                            static_cast<double>(same) * 1e9 / window,
-                            static_cast<double>(changed) * 1e9 / window);
-    }
-    if (const u64 early = data.counters[static_cast<size_t>(Counter::DmaReadsEarly)]; early != 0) {
-        const auto rate = [&](Counter counter) {
-            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
-        };
-        line += fmt::format(" | MME DMA reads without a drain {:.0f} (waited for: unknown writes "
-                            "{:.0f}, GPU work {:.0f}, writes to the words {:.0f})",
-                            static_cast<double>(early) * 1e9 / window,
-                            rate(Counter::DmaReadsWaitUnknown), rate(Counter::DmaReadsWaitGpu),
-                            rate(Counter::DmaReadsWaitWrite));
-    }
-    {
-        const auto rate = [&](Counter counter) {
-            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
-        };
-        if (data.counters[static_cast<size_t>(Counter::AcquirePolls)] != 0 ||
-            data.counters[static_cast<size_t>(Counter::AcquireNoDrain)] != 0) {
-            line += fmt::format(" | acquire polls {:.0f} ({:.0f} without a drain), acquires "
-                                "waiting without a drain {:.0f}, semaphore word not readable: no "
-                                "fast path {:.0f}, GPU-written page {:.0f}, report pending {:.0f}, "
-                                "writers {:.0f}",
-                                rate(Counter::AcquirePolls), rate(Counter::AcquirePollsFast),
-                                rate(Counter::AcquireNoDrain), rate(Counter::SemNoFastPath),
-                                rate(Counter::SemGpuWrittenPage), rate(Counter::SemAsyncPending),
-                                rate(Counter::SemWritersWait));
-        }
-    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {
@@ -455,17 +287,6 @@ inline void Report(const char* thread_name = "GPU thread") {
     if (!drains.empty()) {
         drains.pop_back();
         line += " | waits for the back by site:" + drains;
-    }
-    std::string causes;
-    for (size_t i = 0; i < data.dma_wait_causes.size(); ++i) {
-        if (data.dma_wait_causes[i] != 0) {
-            causes += fmt::format(" {} {:.0f}/s,", dma_wait_cause_names[i],
-                                  static_cast<double>(data.dma_wait_causes[i]) * 1e9 / window);
-        }
-    }
-    if (!causes.empty()) {
-        causes.pop_back();
-        line += " | macro dma reads waited for:" + causes;
     }
     if (cpu_now && data.cpu_start_ns && *cpu_now >= *data.cpu_start_ns) {
         line += fmt::format(" | host_cpu_busy_ms_per_s={:.3f} window_wall_ms={:.3f}",

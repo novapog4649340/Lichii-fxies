@@ -8,6 +8,7 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <QSysInfo>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -544,7 +545,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         }
 
         if (!lp.filepath.empty()) {
-            launched_with_game = true;
             BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
@@ -559,31 +559,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
     }
-
-    // The first launch asks for Ocarina of Time's frame rate (not when started with a game,
-    // e.g. from a shortcut or script: that keeps the 60 FPS default until the next plain launch).
-    if (!launched_with_game && !Settings::values.oot_fps_asked.GetValue()) {
-        QTimer::singleShot(0, this, &MainWindow::AskOotFrameRate);
-    }
-}
-
-void MainWindow::AskOotFrameRate() {
-    QMessageBox box(this);
-    box.setWindowTitle(tr("Ocarina of Time frame rate"));
-    box.setIcon(QMessageBox::Question);
-    box.setText(tr("Which frame rate should Ocarina of Time run at?"));
-    box.setInformativeText(
-        tr("60 FPS needs a fast, recent CPU.\n"
-           "30 FPS is for lower-end PCs. The game keeps its normal speed either way.\n\n"
-           "Switch any time with the 60 FPS / 30 FPS button at the bottom of the window."));
-    QPushButton* const fps60 = box.addButton(tr("60 FPS"), QMessageBox::AcceptRole);
-    QPushButton* const fps30 = box.addButton(tr("30 FPS (lower-end PCs)"), QMessageBox::AcceptRole);
-    box.setDefaultButton(fps60);
-    box.exec();
-    Settings::values.oot_30fps.SetValue(box.clickedButton() == fps30);
-    Settings::values.oot_fps_asked.SetValue(true);
-    UpdateOotFpsButton();
-    config->SaveAllValues();
 }
 
 MainWindow::~MainWindow() {
@@ -1223,17 +1198,6 @@ void MainWindow::InitializeWidgets() {
             });
     statusBar()->insertPermanentWidget(0, gpu_accuracy_button);
 
-    // Ocarina of Time frame rate: one click switches 60 / 30 FPS, at once (also in game).
-    oot_fps_button = new QPushButton();
-    oot_fps_button->setObjectName(QStringLiteral("OotFpsStatusBarButton"));
-    oot_fps_button->setCheckable(true);
-    oot_fps_button->setFocusPolicy(Qt::NoFocus);
-    oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS and "
-                                  "30 FPS (lower-end PCs); it takes effect at once."));
-    connect(oot_fps_button, &QPushButton::clicked, this, &MainWindow::OnToggleOotFrameRate);
-    UpdateOotFpsButton();
-    statusBar()->insertPermanentWidget(0, oot_fps_button);
-
     // Setup Renderer API button
     renderer_status_button = new QPushButton();
     renderer_status_button->setObjectName(QStringLiteral("RendererStatusBarButton"));
@@ -1490,6 +1454,14 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
 }
 
 void MainWindow::ConnectWidgetEvents() {
+    connect(game_list, &GameList::ReportCompatibilityRequested, this, [this](u64 program_id) {
+        if (!report_session || report_session->program_id != program_id || emulation_running ||
+            boot_in_progress || close_pending) {
+            return;
+        }
+        CompatibilityReporting::Dialog dialog(*report_session, this);
+        dialog.exec();
+    });
     connect(game_list, &GameList::BootGame, this, &MainWindow::BootGameFromList);
     connect(game_list, &GameList::GameChosen, this, &MainWindow::OnGameListLoadFile);
     connect(game_list, &GameList::OpenDirectory, this, &MainWindow::OnGameListOpenDirectory);
@@ -1880,6 +1852,13 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
+        case Core::SystemResultStatus::ErrorMemoryAllocation:
+            QMessageBox::critical(
+                this, tr("Not enough memory to start the game"),
+                tr("Lichii could not allocate the game's memory. Close other applications and "
+                   "check that your system has enough available memory and paging-file space, "
+                   "then try again."));
+            break;
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
             QMessageBox::critical(this, tr("Error while loading ROM!"),
@@ -1973,6 +1952,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         return;
     }
     LOG_INFO(Frontend, "Lichii starting...");
+    report_session.reset();
+    game_list->SetReportableProgramId(0);
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -2083,6 +2064,80 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
     LOG_INFO(Frontend, "Core load completed: elapsed_ms={}", load_timer.elapsed());
 
+    const auto report_program_id = QtCommon::system->GetApplicationProcessProgramID();
+    if (Settings::CurrentProgramIsSwitch2() && report_program_id != 0) {
+        auto& session = report_session.emplace();
+        session.program_id = report_program_id;
+        const FileSys::PatchManager pm(report_program_id,
+                                       QtCommon::system->GetFileSystemController(),
+                                       QtCommon::system->GetContentProvider());
+        if (const auto metadata = pm.GetControlMetadata(); metadata.first) {
+            session.title = QString::fromStdString(metadata.first->GetApplicationName());
+            session.game_version = QString::fromStdString(metadata.first->GetVersionString());
+        }
+        if (session.title.trimmed().isEmpty()) {
+            std::string title;
+            if (QtCommon::system->GetGameName(title) == Loader::ResultStatus::Success) {
+                session.title = QString::fromStdString(title);
+            }
+        }
+        FileSys::VirtualFile update_raw;
+        auto& report_loader = QtCommon::system->GetAppLoader();
+        report_loader.ReadUpdateRaw(update_raw);
+        QList<CompatibilityReporting::Addon> mods;
+        QList<CompatibilityReporting::Addon> updates;
+        for (const auto& patch : pm.GetPatches(update_raw)) {
+            auto* entries = patch.type == FileSys::PatchType::Mod      ? &mods
+                            : patch.type == FileSys::PatchType::Update ? &updates
+                                                                       : nullptr;
+            if (entries) {
+                entries->push_back({QString::fromStdString(patch.name),
+                                    QString::fromStdString(patch.version), patch.enabled});
+            }
+        }
+        if (report_loader.GetFileType() == Loader::FileType::NUP) {
+            std::string version;
+            if (report_loader.ReadDisplayVersion(version) == Loader::ResultStatus::Success &&
+                !version.empty()) {
+                session.game_version = QString::fromStdString(version);
+                updates.push_back(
+                    {QStringLiteral("Loaded NUP package"), session.game_version, true});
+            }
+        }
+        session.mods = CompatibilityReporting::SummarizeEnabledAddons(mods);
+        session.updates = CompatibilityReporting::SummarizeEnabledAddons(updates);
+        session.build = QStringLiteral("Lichii %1 (%2)")
+                            .arg(QString::fromUtf8(Common::g_build_version),
+                                 QString::fromUtf8(Common::g_scm_rev).left(12));
+#ifdef ARCHITECTURE_x86_64
+        session.cpu = QString::fromLatin1(Common::g_cpu_caps.cpu_string,
+                                          sizeof(Common::g_cpu_caps.cpu_string))
+                          .section(QChar{}, 0, 0)
+                          .trimmed();
+#endif
+        session.os = QSysInfo::prettyProductName();
+        const auto memory = Common::GetMemInfo().TotalPhysicalMemory;
+        if (memory != 0) {
+            session.ram =
+                QStringLiteral("%1 GiB").arg(double(memory) / (1024 * 1024 * 1024), 0, 'f', 1);
+        }
+        const auto& device_info = QtCommon::system->Renderer().GetDeviceInfo();
+        session.gpu = QString::fromStdString(device_info.model);
+        session.driver = QString::fromStdString(device_info.driver);
+        session.graphics_api = QString::fromStdString(device_info.api);
+        session.settings =
+            QStringLiteral("Launch settings: %1 mode; resolution scale %2x; "
+                           "GPU accuracy %3; asynchronous shaders %4.")
+                .arg(Settings::IsDockedMode() ? QStringLiteral("Docked")
+                                              : QStringLiteral("Handheld"))
+                .arg(Settings::values.resolution_info.up_factor)
+                .arg(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High
+                         ? QStringLiteral("High")
+                         : QStringLiteral("Low"))
+                .arg(Settings::values.use_asynchronous_shaders.GetValue() ? QStringLiteral("on")
+                                                                          : QStringLiteral("off"));
+    }
+
     QtCommon::system->SetShuttingDown(false);
     game_list->setDisabled(true);
 
@@ -2186,7 +2241,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     emulation_running = true;
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
-    } else {
+    } else if (!(ui->action_Single_Window_Mode->isChecked() ? isMaximized()
+                                                            : render_window->isMaximized())) {
         if (Settings::IsDockedMode()) {
             ResetWindowSize1080();
         } else {
@@ -2312,6 +2368,8 @@ void MainWindow::OnEmulationStopped() {
     }
 
     emulation_running = false;
+
+    game_list->SetReportableProgramId(report_session ? report_session->program_id : 0);
 
     discord_rpc->Update();
     Common::FeralGamemode::Stop();
@@ -3499,6 +3557,17 @@ void MainWindow::ResetWindowSize(u32 width, u32 height) {
     const auto aspect_ratio = Layout::EmulationAspectRatio(Settings::values.aspect_ratio.GetValue(),
                                                            float(height) / width);
     const bool single_window = ui->action_Single_Window_Mode->isChecked();
+    // Resizing a maximized window leaves it marked as maximized at the new size, stuck in a corner.
+    if (single_window && isMaximized()) {
+        showNormal();
+    } else if (!single_window && render_window->isMaximized()) {
+        // A stopped game hides the render window; showNormal() would show it again.
+        if (render_window->isHidden()) {
+            render_window->setWindowState(render_window->windowState() & ~Qt::WindowMaximized);
+        } else {
+            render_window->showNormal();
+        }
+    }
     const bool show_status_bar = ui->action_Show_Status_Bar->isChecked();
     const auto status_bar_height = (single_window && show_status_bar) ? statusBar()->height() : 0;
     const auto menu_bar_height = single_window ? menuBar()->height() : 0;
@@ -4586,6 +4655,11 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
     if (!emulation_running || program_id == 0)
         return;
 
+    if (report_session && report_session->program_id != program_id) {
+        report_session.reset();
+        game_list->SetReportableProgramId(0);
+    }
+
     std::string title_name;
     std::string title_version;
 
@@ -4755,19 +4829,6 @@ void MainWindow::UpdateGPUAccuracyButton() {
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
 
-void MainWindow::UpdateOotFpsButton() {
-    const bool fps30 = Settings::values.oot_30fps.GetValue();
-    oot_fps_button->setChecked(fps30);
-    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
-}
-
-void MainWindow::OnToggleOotFrameRate() {
-    Settings::values.oot_30fps.SetValue(!Settings::values.oot_30fps.GetValue());
-    Settings::values.oot_fps_asked.SetValue(true);
-    UpdateOotFpsButton();
-    config->SaveAllValues();
-}
-
 void MainWindow::UpdateDockedButton() {
     const auto console_mode = Settings::values.use_docked_mode.GetValue();
     dock_status_button->setChecked(Settings::IsDockedMode());
@@ -4834,7 +4895,6 @@ void MainWindow::UpdateStatusButtons() {
     UpdateAPIText();
     UpdateGPUAccuracyButton();
     UpdateDockedButton();
-    UpdateOotFpsButton();
     UpdateFilterText();
     UpdateAAText();
     UpdateVolumeUI();

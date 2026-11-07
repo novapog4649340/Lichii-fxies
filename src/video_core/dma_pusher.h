@@ -7,7 +7,6 @@
 #pragma once
 
 #include <array>
-#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <optional>
@@ -188,6 +187,11 @@ public:
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
 private:
+    friend struct DmaPusherTestAccess;
+
+    static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
+                               u32 method);
+
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
@@ -212,10 +216,6 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// EDEN_NX2_LIST_FAST: whether an entry of `size` bytes skips the wait for queued writers.
-    bool SkipWriterWait(u64 size);
-    u64 list_fast_marks{};
-    std::chrono::steady_clock::time_point list_fast_since{};
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.

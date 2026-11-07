@@ -23,7 +23,6 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
-#include "video_core/split_write_tracker.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {
@@ -43,6 +42,8 @@ class RasterizerInterface;
 }
 
 namespace Tegra::Engines {
+
+class Puller;
 
 /// Draws left to trace after an upscale fallback (debug aid).
 extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
@@ -67,8 +68,6 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
-    /// Whether a write to `method` can write memory (a dispatch, upload or report): with the
-    /// native class, every method besides those that only store their value; macros always.
     [[nodiscard]] bool MayWriteMemory(u32 method) const {
         if (method >= native_plain_methods.size()) {
             return true;
@@ -78,6 +77,8 @@ public:
 
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
+    /// The channel's puller, told about the semaphore releases the split's front sends.
+    void SetFrontPuller(Puller* puller) { front_puller = puller; }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {
         if (native_context != context) native_compute_uploaded = false;
         native_context = context;
@@ -256,10 +257,6 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
-    /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
-    /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
-    /// tonemapped image.
-    bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
@@ -280,23 +277,16 @@ private:
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    /// Tells the split a semaphore release just sent writes a known payload.
-    void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& state, u32 control) const;
-    bool FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
-                         u32 argument);
-    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
-    /// What a method sent from the front may write on the back (GpuSplit::Effect).
-    VideoCommon::SplitWriteTracker::Effect FrontEffect(u32 method) const;
-    /// After sending it: the memory it writes, for the front's reads.
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// SET_REPORT_SEMAPHORE_D sent from the front: a plain release is noted to the puller, so an
+    /// acquire it meets while still queued needs no wait (Frizti/Lichii 9932d05c4a).
+    void FrontNoteRelease(const FrontState& state, u32 control) const;
+    Puller* front_puller{};
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
-    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
-    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();
@@ -363,7 +353,6 @@ private:
     void ProcessLaunch();
 
     void ConsumeSinkImpl(Core::System& system) override;
-    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;

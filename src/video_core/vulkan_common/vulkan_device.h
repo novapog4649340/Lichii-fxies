@@ -14,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -73,15 +74,13 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
-    FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                               FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
-    FEATURE(KHR, PresentId, PRESENT_ID, present_id)                                                \
-    FEATURE(KHR, PresentWait, PRESENT_WAIT, present_wait)                                          \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
     FEATURE(KHR, ShaderMaximalReconvergence, SHADER_MAXIMAL_RECONVERGENCE,                        \
             shader_maximal_reconvergence)                                                        \
@@ -373,6 +372,23 @@ public:
                id != VK_DRIVER_ID_MESA_RADV;
     }
 
+    /// AMD's own drivers can spend minutes on a software HMMA compute pipeline (Ocarina of
+    /// Time's upscaling network) and then fail it with VK_ERROR_OUT_OF_HOST_MEMORY. Such
+    /// pipelines are built on their own worker and their dispatches skipped until they exist,
+    /// instead of stalling the GPU thread. EDEN_NX2_DEFER_MATRIX_PIPELINES=1 forces this on any
+    /// driver, =0 turns it off.
+    bool DefersSoftwareMatrixPipelines() const {
+        static const char forced = [] {
+            const char* value = std::getenv("EDEN_NX2_DEFER_MATRIX_PIPELINES");
+            return value == nullptr ? '\0' : value[0];
+        }();
+        if (forced == '0' || forced == '1') {
+            return forced == '1';
+        }
+        const VkDriverIdKHR id = GetDriverID();
+        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+    }
+
     /// Returns true for tile-based deferred renderers.
     bool IsTiler() const {
         switch (GetDriverID()) {
@@ -395,7 +411,32 @@ public:
 
     /// Returns storage alignment requirement.
     VkDeviceSize GetStorageBufferAlignment() const {
-        return properties.properties.limits.minStorageBufferOffsetAlignment;
+        // Experiment: EDEN_NX2_SSBO_ALIGN=<bytes> raises the alignment storage buffers are bound at.
+        static const VkDeviceSize forced = [] {
+            const char* value = std::getenv("EDEN_NX2_SSBO_ALIGN");
+            return value == nullptr ? VkDeviceSize{0} : std::strtoull(value, nullptr, 10);
+        }();
+        const VkDeviceSize limit = properties.properties.limits.minStorageBufferOffsetAlignment;
+        return forced > limit && (forced & (forced - 1)) == 0 ? forced : limit;
+    }
+
+    /// Experiment: EDEN_NX2_WARP_EXACT=1 runs every stage that allows it at the guest warp size
+    /// and emits shaders as for a 32-wide host (no wider-warp emulation), as on NVIDIA.
+    static bool WarpExact() {
+        static const bool on = [] {
+            const char* value = std::getenv("EDEN_NX2_WARP_EXACT");
+            return value != nullptr && value[0] == '1';
+        }();
+        return on;
+    }
+
+    /// Experiment: EDEN_NX2_AMD_QUIRK_OFF=demote,gather,logicop turns off AMD-only workarounds.
+    static bool AmdQuirkOff(std::string_view quirk) {
+        static const std::string list = [] {
+            const char* value = std::getenv("EDEN_NX2_AMD_QUIRK_OFF");
+            return value == nullptr ? std::string{} : std::string{value};
+        }();
+        return list.find(quirk) != std::string::npos;
     }
 
     /// Returns the maximum range for storage buffers.
@@ -425,7 +466,10 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
-    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments)
+    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(FramebufferWidth) \
+    FN_MAX_LIMIT_ELEM(FramebufferHeight) \
+    FN_MAX_LIMIT_ELEM(FramebufferLayers)
 #define FN_MAX_LIMIT_ELEM(name) \
     u32 GetMax##name() const { return properties.properties.limits.max##name; }
 FN_MAX_LIMIT_LIST
@@ -679,15 +723,6 @@ FN_MAX_LIMIT_LIST
     }
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
-    bool IsPipelineStatisticsQuerySupported() const {
-        return features.features.pipelineStatisticsQuery;
-    }
-
-    /// Whether presents can carry ids and be waited on until shown (the host frame pacer).
-    bool IsKhrPresentWaitSupported() const {
-        return extensions.present_id && extensions.present_wait;
-    }
-
     bool IsExtMeshShaderSupported() const {
         return extensions.mesh_shader && features.mesh_shader.taskShader &&
                features.mesh_shader.meshShader;
@@ -968,6 +1003,12 @@ FN_MAX_LIMIT_LIST
     bool SupportsTransformFeedbackProvokingVertexPreservation() const {
         return extensions.provoking_vertex &&
                features.provoking_vertex.transformFeedbackPreservesProvokingVertex;
+    }
+
+    /// Returns true if storage buffers support native 32-bit float atomic adds.
+    bool IsFloat32AtomicAddSupported() const {
+        return extensions.shader_atomic_float &&
+               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
     }
 
     /// Returns true if the device supports VK_KHR_shader_atomic_int64.

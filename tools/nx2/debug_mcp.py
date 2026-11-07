@@ -14,6 +14,7 @@ be restarted between calls: the adapter reconnects on demand.
 import argparse
 import base64
 import json
+import math
 import os
 import socket
 import subprocess
@@ -37,6 +38,19 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"fps_window_ms": {"type": "integer", "minimum": 0, "maximum": 5000}},
+        },
+    },
+    {
+        "name": "frame_times",
+        "description": "Guest-present frame intervals over seconds (default 5, max 60): mean, "
+                       "fps, percentiles, VSync interval shares (refresh_hz defaults to 60), "
+                       "stutters and the last 120 intervals. Reports ring overflow as truncated.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60, "default": 5},
+                "refresh_hz": {"type": "number", "exclusiveMinimum": 0, "default": 60},
+            },
         },
     },
     {
@@ -136,30 +150,6 @@ TOOLS = [
                 "seconds": {"type": "number", "minimum": 1, "maximum": 60},
                 "max_chars": {"type": "integer", "minimum": 0},
             },
-        },
-    },
-    {
-        "name": "timeline",
-        "description": "Records what the emulator's threads (guest present, GPU front and back, "
-                       "Vulkan worker) do and wait for, for the given seconds, and writes a "
-                       "Chrome trace (open in ui.perfetto.dev) to the dump directory.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"seconds": {"type": "number", "minimum": 0.1, "maximum": 30},
-                           "detail": {"type": "boolean",
-                                      "description": "Also per-draw stages and method calls (slows the GPU threads)"}},
-        },
-    },
-    {
-        "name": "switch",
-        "description": "Reads or sets a live experiment switch (EDEN_NX2_DMA_WAIT_WRITERS).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "value": {"type": "integer"},
-            },
-            "required": ["name"],
         },
     },
     {
@@ -321,10 +311,10 @@ def default_timeout(name, params):
     """The emulator's own timeout_s default, so the adapter waits at least as long."""
     if name == "capture_frame":
         return 120
+    if name == "frame_times":
+        return math.ceil(params.get("seconds", 5)) + 1
     if name == "sample":
         return int(params.get("seconds", 10)) + 90
-    if name == "timeline":
-        return int(params.get("seconds", 5)) + 60
     if name in ("input", "input_sequence"):
         steps = params.get("steps", []) if name == "input_sequence" else [params]
         return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10
@@ -407,7 +397,7 @@ class Adapter:
             try:
                 content = self.call_tool(params.get("name"), params.get("arguments") or {})
                 reply["result"] = {"content": content, "isError": False}
-            except (EmulatorError, KeyError, ValueError) as error:
+            except (EmulatorError, KeyError, ValueError, TypeError) as error:
                 message_text = f"missing argument {error}" if isinstance(error, KeyError) else str(error)
                 reply["result"] = {"content": [text(message_text)], "isError": True}
         else:

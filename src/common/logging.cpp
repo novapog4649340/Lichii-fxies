@@ -11,7 +11,6 @@
 #include <deque>
 #include <mutex>
 #include <regex>
-#include <string_view>
 #include <thread>
 
 #if defined(__ANDROID__)
@@ -33,7 +32,6 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/polyfill_thread.h"
-#include "common/scm_rev.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
@@ -159,9 +157,6 @@ struct Backend {
     virtual void Flush() noexcept = 0;
 };
 
-/// @brief Formatting specifier (to use with printf) of the equivalent fmt::format() expression
-#define CCB_PRINTF_FMT "[%4d.%06d] %s <%s> %s:%u:%s: %s"
-
 /// @brief Instead of using fmt::format() just use the system's formatting capabilities directly
 struct DirectFormatArgs {
     const char *class_name;
@@ -203,7 +198,13 @@ struct ColorConsoleBackend final : public Backend {
             }());
             SetConsoleTextAttribute(console_handle, color);
             auto const df = GetDirectFormatArgs(entry);
-            std::fprintf(stdout, CCB_PRINTF_FMT "\n", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function, entry.message);
+            // One write per line: MinGW's fprintf emits each character separately, and stdout is
+            // unbuffered here, so every character became a WriteFile on the thread that logs.
+            fmt::memory_buffer line;
+            fmt::format_to(fmt::appender(line), "[{:4d}.{:06d}] {} <{}> {}:{}:{}: ", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function);
+            line.append(entry.message, entry.message + entry.message_len);
+            line.push_back('\n');
+            std::fwrite(line.data(), 1, line.size(), stdout);
         }
     }
     void Flush() noexcept override {}
@@ -274,18 +275,8 @@ struct FileBackend final : public Backend {
                         return std::string{s};
                 return std::string{};
             }();
-            if (!username.empty()) {
-                // The build version can contain the username ("Frizti v2" for user "Frizt").
-                const std::string_view version{Common::g_build_version};
-                const bool keep_version =
-                    !version.empty() && version.find(username) != std::string_view::npos &&
-                    message.find(version) != std::string::npos;
-                if (keep_version)
-                    boost::replace_all(message, version, "\x01");
+            if (!username.empty())
                 boost::replace_all(message, username, "user");
-                if (keep_version)
-                    boost::replace_all(message, "\x01", version);
-            }
         }
 #endif
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});

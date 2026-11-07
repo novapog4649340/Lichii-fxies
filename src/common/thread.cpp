@@ -5,15 +5,19 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/adpf.h"
+#include "common/core_pinning.h"
 #include "common/error.h"
 #include "common/event_wait.h"
 #include "common/logging.h"
-#include "common/nx2_sample_profile.h"
 #include "common/assert.h"
 #include "common/thread.h"
 #ifdef __APPLE__
@@ -448,6 +452,92 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
 #include "common/x64/rdtsc.h"
 #endif
 
+#ifdef _WIN32
+namespace {
+// Hybrid CPUs (Intel P/E cores): Windows alone may run the emulator's time-critical threads on an
+// efficiency core, where a frame takes much longer. Keep them on the fastest cores with CPU sets
+// (a soft affinity the power manager respects) and background workers on the slower ones.
+// EDEN_HYBRID_CORES=0 turns this off.
+struct WindowsCpuSets {
+    std::vector<Common::LogicalProcessor> processors;
+    std::vector<ULONG> performance;
+    std::vector<ULONG> efficiency;
+    bool hybrid = false;
+};
+
+const WindowsCpuSets& CpuSets() {
+    static const WindowsCpuSets sets = [] {
+        WindowsCpuSets result;
+        if (const char* text = std::getenv("EDEN_HYBRID_CORES");
+            text != nullptr && std::strtol(text, nullptr, 10) == 0) {
+            LOG_INFO(Common, "Hybrid core placement off (EDEN_HYBRID_CORES=0)");
+            return result;
+        }
+        using PFN_GetSystemCpuSetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
+                                                             PULONG, HANDLE, ULONG);
+        const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        const auto get = reinterpret_cast<PFN_GetSystemCpuSetInformation>(
+            reinterpret_cast<void*>(GetProcAddress(kernel32, "GetSystemCpuSetInformation")));
+        if (get == nullptr) {
+            return result;
+        }
+        ULONG length = 0;
+        get(nullptr, 0, &length, GetCurrentProcess(), 0);
+        if (length == 0) {
+            return result;
+        }
+        std::vector<u8> buffer(length);
+        if (!get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length,
+                 GetCurrentProcess(), 0)) {
+            return result;
+        }
+        u8 best = 0;
+        for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+            const auto* info =
+                reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (info->Size == 0) {
+                break;
+            }
+            if (info->Type == CpuSetInformation) {
+                const u32 core =
+                    (static_cast<u32>(info->CpuSet.Group) << 8) | info->CpuSet.CoreIndex;
+                result.processors.push_back({static_cast<u32>(info->CpuSet.Id), core,
+                                             static_cast<u8>(info->CpuSet.EfficiencyClass)});
+                best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+            }
+            offset += info->Size;
+        }
+        for (const Common::LogicalProcessor& processor : result.processors) {
+            (processor.efficiency_class == best ? result.performance : result.efficiency)
+                .push_back(processor.id);
+        }
+        result.hybrid = !result.efficiency.empty() && result.performance.size() >= 2;
+        if (result.hybrid) {
+            LOG_INFO(Common,
+                     "Hybrid CPU: {} performance and {} efficiency logical processors, "
+                     "time-critical threads stay on the performance cores",
+                     result.performance.size(), result.efficiency.size());
+        }
+        return result;
+    }();
+    return sets;
+}
+
+void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
+    using PFN_SetThreadSelectedCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    static const auto set = reinterpret_cast<PFN_SetThreadSelectedCpuSets>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets")));
+    if (set == nullptr) {
+        return;
+    }
+    if (!set(GetCurrentThread(), ids.empty() ? nullptr : ids.data(),
+             static_cast<ULONG>(ids.size()))) {
+        LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
+    }
+}
+} // Anonymous namespace
+#endif
+
 namespace Common {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -505,13 +595,15 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
-    Nx2SampleProfile::OnThreadNamed(name);
-#ifdef _MSC_VER
-    // Sets the debugger-visible name of the current thread.
-    if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
-        pf(GetCurrentThread(), UTF8ToUTF16W(name).data()); // Windows 10+
-    else
-        ; // No-op
+#ifdef _WIN32
+    // Sets the debugger-visible name of the current thread (Windows 10+). Looked up at run time,
+    // which also covers MinGW, whose headers may not declare it.
+    using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const auto set_description = reinterpret_cast<SetThreadDescriptionFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "SetThreadDescription")));
+    if (set_description) {
+        set_description(GetCurrentThread(), UTF8ToUTF16W(name).c_str());
+    }
 #elif  defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__HAIKU__)
@@ -531,11 +623,6 @@ void SetCurrentThreadName(const char* name) {
         buf[len] = '\0';
         pthread_setname_np(pthread_self(), buf);
     }
-#elif defined(_WIN32)
-    // MinGW with the POSIX threading model does not support pthread_setname_np
-    // See for reference
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blame/main/src/util/u_thread.c?ref_type=heads#L75
-    (void)name;
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
@@ -548,62 +635,48 @@ void SetCurrentThreadToPerformanceCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
+#elif defined(_WIN32)
+    if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
+        SelectCurrentThreadCpuSets(sets.performance);
+    }
 #endif
 }
 
 void PinCurrentThread(PinnedRole role) {
 #ifdef _WIN32
-    // Off with EDEN_NX2_PIN_THREADS=0. On by default with 6 or more physical cores: the split's
-    // back did about 8% more draws a second at Lake Hylia (Ryzen 7 7800X3D), its worst window
-    // 29 -> 54 fps, once no SMT sibling shared its core.
-    static const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
-    if (setting != nullptr && setting[0] == '0') {
-        return;
-    }
-    // Physical cores of processor group 0, as masks of their logical processors.
-    static const std::vector<KAFFINITY> cores = [] {
-        std::vector<KAFFINITY> result;
-        DWORD length = 0;
-        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
-        std::vector<u8> buffer(length);
-        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
-            return result;
+    struct PinnedCpuSets {
+        std::vector<ULONG> front;
+        std::vector<ULONG> back;
+        std::vector<ULONG> guest;
+    };
+    static const PinnedCpuSets pinned = [] {
+        const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
+        if (plan.front.empty()) {
+            LOG_WARNING(Common,
+                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                        plan.performance_cores, MinCoresForGpuThreadPinning);
+            return PinnedCpuSets{};
         }
-        for (DWORD offset = 0; offset < length;) {
-            auto* entry =
-                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
-            if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0) {
-                result.push_back(entry->Processor.GroupMask[0].Mask);
-            }
-            offset += entry->Size;
-        }
-        return result;
+        LOG_INFO(Common,
+                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
+                 "other {} performance cores ({} logical processors)",
+                 plan.performance_cores - 2, plan.guest.size());
+        return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
+                             {plan.back.begin(), plan.back.end()},
+                             {plan.guest.begin(), plan.guest.end()}};
     }();
-    // Core 0 takes most interrupts: the GPU threads get cores 1 and 2.
-    if (cores.size() < (setting != nullptr && setting[0] == '1' ? 4U : 6U)) {
-        return;
+    const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
+                                    : role == PinnedRole::GpuBack ? pinned.back
+                                                                  : pinned.guest;
+    if (!ids.empty()) {
+        SelectCurrentThreadCpuSets(ids);
     }
-    const KAFFINITY front = cores[1];
-    const KAFFINITY back = cores[2];
-    KAFFINITY mask{};
-    switch (role) {
-    case PinnedRole::GpuFront:
-        mask = front;
-        break;
-    case PinnedRole::GpuBack:
-        mask = back;
-        break;
-    case PinnedRole::GuestCore:
-        for (const KAFFINITY core : cores) {
-            mask |= core;
-        }
-        mask &= ~(front | back);
-        break;
-    }
-    if (mask != 0) {
-        SetThreadAffinityMask(GetCurrentThread(), mask);
-    }
+#else
+    (void)role;
+    [[maybe_unused]] static const bool logged = [] {
+        LOG_INFO(Common, "GPU thread pinning is only supported on Windows");
+        return true;
+    }();
 #endif
 }
 
@@ -614,6 +687,10 @@ void SetCurrentThreadToEfficiencyCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Efficiency);
+#elif defined(_WIN32)
+    if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
+        SelectCurrentThreadCpuSets(sets.efficiency);
+    }
 #endif
 }
 
@@ -621,6 +698,10 @@ void SetCurrentThreadToBackgroundWork() {
 #if defined(__ANDROID__)
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(_WIN32)
+    if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
+        SelectCurrentThreadCpuSets({});
+    }
 #endif
 }
 
@@ -628,6 +709,10 @@ void SetCurrentThreadToAllCores() {
 #if defined(__ANDROID__)
     ADPF::RemoveCurrentThread();
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(_WIN32)
+    if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
+        SelectCurrentThreadCpuSets({});
+    }
 #endif
 }
 

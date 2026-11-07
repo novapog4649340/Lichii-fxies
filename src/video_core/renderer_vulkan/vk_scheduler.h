@@ -23,10 +23,8 @@
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
-#include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
-#include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -94,10 +92,12 @@ public:
             return;
         }
         const u32 query = trace_work_count * 2;
-        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+        trace_work_items[trace_work_count++] = {hash, fragment_hash, size, trace_gpu_count,
+                                                vk::CmdTrace::g_ops};
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
+        vk::CmdTrace::g_ops = {};
     }
 
     /// Sends currently recorded work to the worker thread.
@@ -242,8 +242,6 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
-            VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
-            Common::Nx2Timeline::Span timeline_span{"wait for host GPU"};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
@@ -478,6 +476,10 @@ private:
         u64 fragment_hash{};
         /// Dispatch grid, or vertex and instance counts of a draw; zero when indirect.
         std::array<u32, 3> size{};
+        /// Which measured submission it is in: gaps are only counted within one.
+        u32 submission{};
+        /// Commands recorded since the previous timed item (vk::CmdTrace).
+        std::array<u16, vk::CmdTrace::Count> ops_before{};
     };
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;

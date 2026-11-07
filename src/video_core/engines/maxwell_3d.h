@@ -3287,8 +3287,6 @@ private:
 
     void ConsumeSinkImpl(Core::System& system) override;
 
-    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
-
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
@@ -3313,12 +3311,13 @@ private:
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
+    /// Read once at startup: state writes check it one by one (no guard to check).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
 
     /// Handles writes to the macro uploading register.
     void ProcessMacroUpload(u32 data);
@@ -3403,26 +3402,15 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-public:
-    /// Split front: whether the 3D macro `method`, called with `count` parameters that GPU work
-    /// wrote, only copies the first into the draw's vertex count (dry runs on copies of its
-    /// state, nx2_indirect_grid.h). Then the parameters can stay placeholders.
-    bool FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              u32 count);
-private:
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
-    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
-                              const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
-    /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
-    void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs, u32 query) const;
-    /// The memory `amount` words of `method` write, if known (constant buffer uploads, reports).
-    std::pair<GPUVAddr, GPUVAddr> FrontWriteRange(const FrontState& state, u32 method,
-                                                  u32 amount) const;
-    bool FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
-                           GPUVAddr source, u32 ram, u32 words);
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 amount,
+                         const u32* values);
+    /// Calls func(index, device address) for `count` words from `begin`, while it returns true.
+    template <typename Func>
+    bool DeviceWords(GPUVAddr begin, u32 count, Func&& func);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

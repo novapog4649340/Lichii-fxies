@@ -229,7 +229,6 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
 #endif
     X(vkGetQueryPoolResults);
     X(vkGetPipelineExecutablePropertiesKHR);
-    X(vkWaitForPresentKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);

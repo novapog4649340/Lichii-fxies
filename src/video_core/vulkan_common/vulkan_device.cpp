@@ -1417,15 +1417,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 }
 
 void Device::RemoveUnsuitableExtensions() {
-    // VK_KHR_present_id, VK_KHR_present_wait (the host frame pacer, vk_host_pacer.h)
-    extensions.present_id = extensions.present_id && features.present_id.presentId;
-    extensions.present_wait =
-        extensions.present_id && extensions.present_wait && features.present_wait.presentWait;
-    RemoveExtensionFeatureIfUnsuitable(extensions.present_wait, features.present_wait,
-                                       VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-    RemoveExtensionFeatureIfUnsuitable(extensions.present_id, features.present_id,
-                                       VK_KHR_PRESENT_ID_EXTENSION_NAME);
-
     // VK_EXT_color_write_enable
     extensions.color_write_enable = features.color_write_enable.colorWriteEnable;
     RemoveExtensionFeatureIfUnsuitable(extensions.color_write_enable, features.color_write_enable,
@@ -1538,7 +1529,8 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
 
     // VK_EXT_robustness2
-    features.robustness2.robustBufferAccess2 = VK_FALSE;
+    // Keep robustBufferAccess2: games read storage buffers out of bounds and AMD returns garbage
+    // without it (Ocarina's Hyrule Field fog volume turned the sky white).
     features.robustness2.robustImageAccess2 = VK_FALSE;
     extensions.robustness_2 = features.robustness2.nullDescriptor;
 
@@ -1549,6 +1541,19 @@ void Device::RemoveUnsuitableExtensions() {
 
     RemoveExtensionFeatureIfUnsuitable(extensions.robustness_2, features.robustness2,
                                        robustness2_extension_name);
+
+    // VK_EXT_shader_atomic_float: only 32-bit float adds on storage buffers are used.
+    {
+        const VkBool32 buffer_add = features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
+        void* const next_feature = features.shader_atomic_float.pNext;
+        features.shader_atomic_float = {};
+        features.shader_atomic_float.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+        features.shader_atomic_float.pNext = next_feature;
+        features.shader_atomic_float.shaderBufferFloat32AtomicAdd = buffer_add;
+        RemoveExtensionFeatureIfUnsuitable(buffer_add == VK_TRUE, features.shader_atomic_float,
+                                           VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
 
     // Image robustness
     extensions.robust_image_access = features.robust_image_access.robustImageAccess;

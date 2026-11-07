@@ -167,9 +167,11 @@ add_library(video_core STATIC
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
     renderer_vulkan/framebuffer_clear_layers.h
+    renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -212,8 +214,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
-    renderer_vulkan/vk_host_pacer.cpp
-    renderer_vulkan/vk_host_pacer.h
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
     renderer_vulkan/vk_rasterizer.cpp
@@ -241,6 +241,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_turbo_mode.h
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
+    renderer_vulkan/descriptor_payload_growth.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -454,10 +455,6 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
-if (WIN32)
-    # The host frame pacer reads the compositor's timing (renderer_vulkan/vk_host_pacer.cpp).
-    target_link_libraries(video_core PRIVATE dwmapi)
-endif()
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()

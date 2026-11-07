@@ -34,10 +34,6 @@ struct TICEntry;
 }
 } // namespace Tegra
 
-namespace VideoCommon::OotNetwork {
-struct BypassState;
-}
-
 namespace VideoCore {
 
 enum class LoadCallbackStage {
@@ -46,10 +42,6 @@ enum class LoadCallbackStage {
     Complete,
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
-
-/// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
-/// manager makes that fence even when it is empty (FenceManager::SignalFence).
-inline thread_local bool g_signaling_query_report_fence = false;
 
 class RasterizerInterface {
 public:
@@ -129,9 +121,6 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
-    /// Switch 2, on the split's back with the front waiting: flushes the command list pages
-    /// `pages` (4 KiB, device addresses) to guest memory, with every page draws wrote since it was
-    /// last flushed, in one GPU round trip.
     virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
         for (const DAddr page : pages) {
             FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
@@ -145,17 +134,15 @@ public:
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
     /// Whether reports in the range wait for host query results not yet in guest memory.
+    /// Whether the query cache holds a report in the region; callable from the split's front.
+    [[nodiscard]] virtual bool HasCachedQueries([[maybe_unused]] DAddr addr,
+                                                [[maybe_unused]] u64 size) {
+        return true;
+    }
+
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {
         return false;
-    }
-
-    /// Whether the query cache still lists a report in the range (pending host results, or
-    /// written and not unregistered yet). Takes only the query cache mutex: callable from the
-    /// split front. Conservative (true) where not implemented.
-    [[nodiscard]] virtual bool HasCachedReports([[maybe_unused]] DAddr addr,
-                                                [[maybe_unused]] u64 size) {
-        return true;
     }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
@@ -265,12 +252,6 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
-    }
-
-    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
-    /// this backend cannot bypass it.
-    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
-        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

@@ -6,8 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <unordered_map>
 #include <cstring>
 #include <cstdlib>
 #include <span>
@@ -30,6 +28,17 @@
 
 namespace Vulkan {
 namespace {
+void HostReadBarrier(vk::CommandBuffer cmdbuf) {
+    const VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                           barrier);
+}
+
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
     return VkBufferCopy{
         .srcOffset = copy.src_offset,
@@ -71,10 +80,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     if (device.IsExtTransformFeedbackSupported()) {
-        // The counter usage too: draws can take their vertex count from any buffer
-        // (DrawIndirectByteCountEXT, nx2_indirect_grid.h).
-        flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
-                 VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
+        flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
     }
     if (device.IsExtConditionalRendering()) {
         flags |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
@@ -478,86 +484,7 @@ void BufferCacheRuntime::Wait(u64 tick) {
     scheduler.Wait(tick);
 }
 
-namespace {
-// EDEN_NX2_LIST_WAIT_TRACE=1: the front's waits for GPU-written command list copies, per writer
-// (the dispatch's shader hash, 0 for a DMA copy): count, time, and how many submissions the GPU
-// still had to finish when the wait began. Logged every 2 s.
-class ListWaitTrace {
-public:
-    static ListWaitTrace* Get() {
-        static const bool enabled = std::getenv("EDEN_NX2_LIST_WAIT_TRACE") != nullptr;
-        static ListWaitTrace trace;
-        return enabled ? &trace : nullptr;
-    }
-
-    void Note(u64 writer, u64 behind, bool unsubmitted, std::chrono::steady_clock::duration wait) {
-        const u64 us = static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::microseconds>(wait).count());
-        Entry& entry = entries[writer];
-        ++entry.count;
-        entry.us += us;
-        entry.max_us = (std::max)(entry.max_us, us);
-        entry.behind += behind;
-        entry.unsubmitted += unsubmitted ? 1 : 0;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last < std::chrono::seconds{2}) {
-            return;
-        }
-        const double seconds = std::chrono::duration<double>(now - last).count();
-        last = now;
-        std::vector<std::pair<u64, Entry>> sorted(entries.begin(), entries.end());
-        std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
-        u64 total = 0;
-        u64 count = 0;
-        for (const auto& [key, value] : sorted) {
-            total += value.us;
-            count += value.count;
-        }
-        LOG_INFO(Render_Vulkan, "List waits: {:.1f}/s, {:.2f} ms/s", count / seconds,
-                 total / 1000.0 / seconds);
-        for (size_t i = 0; i < (std::min<size_t>)(sorted.size(), 8); ++i) {
-            const auto& [key, value] = sorted[i];
-            LOG_INFO(Render_Vulkan,
-                     "  writer {:016x}: {:.1f}/s, {:.2f} ms/s, max {} us, {:.1f} submissions "
-                     "behind, {} unsubmitted",
-                     key, value.count / seconds, value.us / 1000.0 / seconds, value.max_us,
-                     static_cast<double>(value.behind) / value.count, value.unsubmitted);
-        }
-        entries.clear();
-    }
-
-private:
-    struct Entry {
-        u64 count{};
-        u64 us{};
-        u64 max_us{};
-        u64 behind{};
-        u64 unsubmitted{};
-    };
-    std::unordered_map<u64, Entry> entries;
-    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-};
-} // Anonymous namespace
-
-void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
-    auto& master = scheduler.GetMasterSemaphore();
-    if (master.IsFree(tick)) {
-        return;
-    }
-    if (ListWaitTrace* const trace = ListWaitTrace::Get()) [[unlikely]] {
-        master.Refresh();
-        const u64 known = master.KnownGpuTick();
-        const bool unsubmitted = !scheduler.IsSubmitted(tick);
-        const auto start = std::chrono::steady_clock::now();
-        WaitSubmittedTickImpl(tick);
-        trace->Note(writer, tick > known ? tick - known : 0, unsubmitted,
-                    std::chrono::steady_clock::now() - start);
-        return;
-    }
-    WaitSubmittedTickImpl(tick);
-}
-
-void BufferCacheRuntime::WaitSubmittedTickImpl(u64 tick) {
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     auto& master = scheduler.GetMasterSemaphore();
     if (master.IsFree(tick)) {
         return;
@@ -578,6 +505,12 @@ void BufferCacheRuntime::WaitSubmittedTickImpl(u64 tick) {
 }
 
 void BufferCacheRuntime::Finish() {
+    scheduler.Finish();
+}
+
+void BufferCacheRuntime::FinishForHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
     scheduler.Finish();
 }
 
@@ -750,7 +683,7 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         vk_buffer = *null_buffer;
     }
     // The same index buffer is still bound in this command buffer (PR #161): skip the rebind.
-    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::IndexRebind) && !VideoCommon::Nx2Perf::Verify()) {
+    if (!VideoCommon::Nx2Perf::Verify()) {
         const u64 epoch = scheduler.RecordingEpoch();
         if (bound_index_valid && vk_buffer == bound_index_buffer &&
             vk_offset == bound_index_offset && vk_index_type == bound_index_type &&

@@ -197,6 +197,13 @@ try
     VideoCore::FxChain::Instance().LoadFromSettings();
 #endif
 
+    device_info = {
+        .model = std::string{device.GetModelName()},
+        .driver = device.GetDriverVersion() != 0
+                      ? fmt::format("{} {}", device.GetVendorName(), GetDriverVersion(device))
+                      : std::string{},
+        .api = "Vulkan",
+    };
     Report();
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
@@ -246,7 +253,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         Frame* generated = present_manager.GetRenderFrame();
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
-        generated->render_tick = scheduler.Flush(*generated->render_ready);
+        scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
     }
 #endif
@@ -254,7 +261,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
-    frame->render_tick = scheduler.Flush(*frame->render_ready);
+    scheduler.Flush(*frame->render_ready);
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -292,10 +299,6 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
 void RendererVulkan::Report() const {
     using namespace Common::Literals;
-    const std::string vendor_name{device.GetVendorName()};
-    const std::string model_name{device.GetModelName()};
-    const std::string driver_version = GetDriverVersion(device);
-    const std::string driver_name = fmt::format("{} {}", vendor_name, driver_version);
 
     const std::string api_version = GetReadableVersion(device.ApiVersion());
 
@@ -303,8 +306,8 @@ void RendererVulkan::Report() const {
 
     const auto available_vram = static_cast<f64>(device.GetDeviceLocalMemory()) / f64{1_GiB};
 
-    LOG_INFO(Render_Vulkan, "Driver: {}", driver_name);
-    LOG_INFO(Render_Vulkan, "Device: {}", model_name);
+    LOG_INFO(Render_Vulkan, "Driver: {} {}", device.GetVendorName(), GetDriverVersion(device));
+    LOG_INFO(Render_Vulkan, "Device: {}", device_info.model);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
     LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
     if (VideoCommon::RenderTrace::Enabled()) {

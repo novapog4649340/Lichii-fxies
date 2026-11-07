@@ -115,7 +115,7 @@ if (MSVC AND NOT CXX_CLANG)
         /we4457 # Declaration of 'identifier' hides function parameter
         /we4458 # Declaration of 'identifier' hides class member
         /we4459 # Declaration of 'identifier' hides global declaration
-        /w4505 # 'function': unreferenced local function has been removed
+        /w44505 # 'function': unreferenced local function has been removed
         /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
         /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
         /we4555 # Expression has no effect; expected expression with side-effect
@@ -147,13 +147,7 @@ if (MSVC AND NOT CXX_CLANG)
     endif()
 
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG   "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
-    # LICHII_LINK_ICF=OFF keeps identical functions apart, so sampling profiles name them right.
-    option(LICHII_LINK_ICF "Fold identical functions when linking Release builds (MSVC)" ON)
-    if (LICHII_LINK_ICF)
-        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
-    else()
-        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,NOICF" CACHE STRING "" FORCE)
-    endif()
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
 else()
     if (NOT MSVC)
         add_compile_options(

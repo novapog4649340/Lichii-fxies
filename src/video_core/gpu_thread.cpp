@@ -4,12 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
 #include <thread>
-
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
@@ -22,6 +19,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -42,6 +40,42 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
     }
 }
 
+// EDEN_NX2_MME_DMA_STATS: where the GPU thread's time goes while channels are suspended.
+struct ThreadStats {
+    enum Kind : size_t { PendingEmpty, Idle, Count };
+    std::array<u64, Count> ns{};
+    std::chrono::steady_clock::time_point last_log{std::chrono::steady_clock::now()};
+
+    struct Timer {
+        Timer(ThreadStats* stats_, Kind kind_)
+            : stats{stats_}, kind{kind_}, start{std::chrono::steady_clock::now()} {}
+        ~Timer() {
+            if (stats) {
+                stats->ns[kind] += static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
+            }
+        }
+        ThreadStats* stats;
+        Kind kind;
+        std::chrono::steady_clock::time_point start;
+    };
+
+    void MaybeLog(bool pending) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log < std::chrono::seconds{5}) {
+            return;
+        }
+        last_log = now;
+        LOG_INFO(HW_GPU,
+                 "GPU thread (5 s): {} ms waiting for commands with channels suspended, {} ms "
+                 "idle with none suspended (suspended now: {})",
+                 ns[PendingEmpty] / 1000000, ns[Idle] / 1000000, pending);
+        ns = {};
+    }
+};
+
 } // Anonymous namespace
 
 ThreadManager::ThreadManager(Core::System& system_)
@@ -55,13 +89,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
-#ifdef __linux__
-        // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
-        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
-#endif
+        VideoCommon::GpuSplit::MarkGpuThread();
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
-        Common::PinCurrentThread(Common::PinnedRole::GpuFront);
         Common::SetCurrentThreadToPerformanceCores();
+        if (Settings::values.pin_gpu_threads.GetValue()) {
+            Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        }
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
@@ -69,37 +102,46 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
-        // Before the split's back thread starts, which reads it too.
-        Profile::Initialize();
         auto& split = VideoCommon::GpuSplit::Get();
+        ThreadStats* const thread_stats =
+            std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr ? new ThreadStats{} : nullptr;
         while (!stop_token.stop_requested()) {
+            if (thread_stats) {
+                thread_stats->MaybeLog(scheduler.HasPendingChannels());
+            }
             Profile::Report();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                const u64 seen_latch = Tegra::Nx2SemaphoreWaiters::Get().LatchEpoch();
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
                     // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
-                    // second and its present waits for the work behind them: with 1 ms sleeps the
+                    // millisecond, then in short waits. Ocarina of Time waits here ~330 times a
+                    // second and its present waits for the work behind them: with 1 ms waits the
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
-                    // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
+                    // still waiting after 2 s (menus, loading) goes back to 1 ms waits.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    const ThreadStats::Timer timer{thread_stats, ThreadStats::PendingEmpty};
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
-                    } else if (waited < std::chrono::seconds{2}) {
-                        std::this_thread::sleep_for(std::chrono::microseconds{50});
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        // A GPU release that meets a suspended acquire wakes this at once;
+                        // CPU releases are still found by polling.
+                        Tegra::Nx2SemaphoreWaiters::Get().WaitForLatch(
+                            seen_latch, waited < std::chrono::seconds{2}
+                                            ? std::chrono::microseconds{50}
+                                            : std::chrono::microseconds{1000});
                     }
                     continue;
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                const ThreadStats::Timer timer{thread_stats, ThreadStats::Idle};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
@@ -122,7 +164,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.Drain(VideoCommon::DrainSite::Map);
                     } else {
                         split.DeferFunction(std::move(run->func));
-                        split.NoteMemoryWrite();
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
@@ -135,11 +176,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 } else {
                     ASSERT(false);
                 }
-                split.Defer(
-                    [state_ptr = &state, fence = next.fence, block = next.block] {
-                        SignalCommand(*state_ptr, fence, block);
-                    },
-                    VideoCommon::GpuSplit::Effect::None);
+                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
+                    SignalCommand(*state_ptr, fence, block);
+                });
                 split.Publish();
                 continue;
             }

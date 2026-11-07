@@ -7,9 +7,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstddef>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -46,6 +49,10 @@ namespace Tegra::Engines {
 
 class Puller final {
 public:
+    /// A semaphore release this channel just queued for the split's back writes `payload`
+    /// (puller releases, and native compute releases through KeplerCompute's front).
+    void NoteRelease(GPUVAddr address, u32 payload);
+
     struct MethodCall {
         u32 method{};
         u32 argument{};
@@ -78,11 +85,8 @@ public:
         u32 value;
         u32 operation;
         std::chrono::steady_clock::time_point since;
+        std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
-        /// Polls that found the word current but unmet (CanResumeAcquire).
-        u32 unmet_polls{};
-        /// When the back was last drained for this acquire: registration, then every drained poll.
-        std::chrono::steady_clock::time_point last_drain{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -153,6 +157,17 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    /// Semaphore releases this channel queued for the split's back: payload and ring position.
+    struct QueuedRelease {
+        u32 payload;
+        u64 position;
+    };
+    std::unordered_map<GPUVAddr, QueuedRelease> queued_releases;
+    /// Whether no queued write or undownloaded GPU write can change the semaphore at `address`.
+    bool StableSemaphore(DmaPusher& dma_pusher, GPUVAddr address);
+    /// The payload of this channel's queued release at `address`, if it is still queued and is
+    /// the last write to it before what is sent now.
+    std::optional<u32> OwnQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address);
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

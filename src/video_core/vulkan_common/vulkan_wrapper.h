@@ -344,7 +344,6 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR{};
 #endif
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
-    PFN_vkWaitForPresentKHR vkWaitForPresentKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
@@ -1130,14 +1129,6 @@ public:
     std::vector<VkPipelineExecutablePropertiesKHR> GetPipelineExecutablePropertiesKHR(
         VkPipeline pipeline) const;
 
-    /// vkWaitForPresentKHR; VK_ERROR_FEATURE_NOT_PRESENT when the function was not loaded.
-    VkResult WaitForPresentKHR(VkSwapchainKHR swapchain, u64 present_id,
-                               u64 timeout_ns) const noexcept {
-        return dld->vkWaitForPresentKHR
-                   ? dld->vkWaitForPresentKHR(handle, swapchain, present_id, timeout_ns)
-                   : VK_ERROR_FEATURE_NOT_PRESENT;
-    }
-
     std::vector<VkPipelineExecutableStatisticKHR> GetPipelineExecutableStatisticsKHR(
         VkPipeline pipeline, u32 executable_index) const;
 
@@ -1245,6 +1236,21 @@ private:
     const InstanceDispatch* dld = nullptr;
 };
 
+/// EDEN_DKB_FRAME_TRACE: the commands recorded on this thread, by kind, so the GPU time between
+/// two timed draws can be put down to what was recorded between them (Scheduler::TraceGpuWork).
+namespace CmdTrace {
+enum Op : u32 { RenderPass, Barrier, BufferCopy, ImageCopy, Clear, Query, QueryCopy, Blit, Dispatch, Count };
+inline constexpr std::array<const char*, Count> op_names{
+    "rp", "bar", "bcopy", "icopy", "clear", "query", "qcopy", "blit", "disp"};
+inline bool g_on = false;
+inline thread_local std::array<u16, Count> g_ops{};
+inline void Note(Op op) noexcept {
+    if (g_on) [[unlikely]] {
+        ++g_ops[op];
+    }
+}
+} // namespace CmdTrace
+
 class CommandBuffer {
 public:
     CommandBuffer() noexcept = default;
@@ -1269,6 +1275,7 @@ public:
 
     void BeginRenderPass(const VkRenderPassBeginInfo& renderpass_bi,
                          VkSubpassContents contents) const noexcept {
+        CmdTrace::Note(CmdTrace::RenderPass);
         dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
     }
 
@@ -1277,6 +1284,7 @@ public:
     }
 
     void BeginQuery(VkQueryPool query_pool, u32 query, VkQueryControlFlags flags) const noexcept {
+        CmdTrace::Note(CmdTrace::Query);
         dld->vkCmdBeginQuery(handle, query_pool, query, flags);
     }
 
@@ -1370,29 +1378,34 @@ public:
 
     void ClearAttachments(Span<VkClearAttachment> attachments,
                           Span<VkClearRect> rects) const noexcept {
+        CmdTrace::Note(CmdTrace::Clear);
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
                          Span<VkImageSubresourceRange> ranges) {
+        CmdTrace::Note(CmdTrace::Clear);
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
     }
 
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageBlit> regions,
                    VkFilter filter) const noexcept {
+        CmdTrace::Note(CmdTrace::Blit);
         dld->vkCmdBlitImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data(), filter);
     }
 
     void ResolveImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                       VkImageLayout dst_layout, Span<VkImageResolve> regions) {
+        CmdTrace::Note(CmdTrace::Blit);
         dld->vkCmdResolveImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                                regions.data());
     }
 
     void Dispatch(u32 x, u32 y, u32 z) const noexcept {
+        CmdTrace::Note(CmdTrace::Dispatch);
         dld->vkCmdDispatch(handle, x, y, z);
     }
 
@@ -1404,6 +1417,7 @@ public:
                          VkDependencyFlags dependency_flags, Span<VkMemoryBarrier> memory_barriers,
                          Span<VkBufferMemoryBarrier> buffer_barriers,
                          Span<VkImageMemoryBarrier> image_barriers) const noexcept {
+        CmdTrace::Note(CmdTrace::Barrier);
         static constexpr u32 MaxBarriers = 16;
         if (dld->vkCmdPipelineBarrier2 && memory_barriers.size() <= MaxBarriers &&
             buffer_barriers.size() <= MaxBarriers && image_barriers.size() <= MaxBarriers) {
@@ -1513,23 +1527,27 @@ public:
 
     void CopyBufferToImage(VkBuffer src_buffer, VkImage dst_image, VkImageLayout dst_image_layout,
                            Span<VkBufferImageCopy> regions) const noexcept {
+        CmdTrace::Note(CmdTrace::ImageCopy);
         dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
                                     regions.data());
     }
 
     void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer,
                     Span<VkBufferCopy> regions) const noexcept {
+        CmdTrace::Note(CmdTrace::BufferCopy);
         dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
     }
 
     void CopyImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageCopy> regions) const noexcept {
+        CmdTrace::Note(CmdTrace::ImageCopy);
         dld->vkCmdCopyImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data());
     }
 
     void CopyImageToBuffer(VkImage src_image, VkImageLayout src_layout, VkBuffer dst_buffer,
                            Span<VkBufferImageCopy> regions) const noexcept {
+        CmdTrace::Note(CmdTrace::ImageCopy);
         dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
                                     regions.data());
     }
@@ -1537,12 +1555,14 @@ public:
     void CopyQueryPoolResults(VkQueryPool query_pool, u32 first_query, u32 query_count,
                               VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                               VkQueryResultFlags flags) const noexcept {
+        CmdTrace::Note(CmdTrace::QueryCopy);
         dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
                                        dst_offset, stride, flags);
     }
 
     void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
                     u32 data) const noexcept {
+        CmdTrace::Note(CmdTrace::Clear);
         dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
     }
 

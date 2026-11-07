@@ -4,27 +4,17 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cstring>
-#include <span>
-#include <string>
-#include <unordered_map>
 #include <cstdlib>
 #include <cstdio>
-#include <string_view>
+#include <span>
 #include <vector>
 
-#include <fmt/format.h>
-
-#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
-#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
@@ -37,7 +27,6 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
-#include "video_core/nx2_indirect_grid.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -45,106 +34,45 @@ namespace Tegra {
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
-namespace {
-// Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads. The
-// register writes that set them up only store a value: marking those too made every list fetch
-// after one wait for all the work queued before it (draws included).
-bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
-                  u32 count) {
+bool DmaPusher::IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
+                              u32 method) {
     if (type == Engines::EngineTypes::KeplerCompute) {
-        const auto* const compute = static_cast<const Engines::KeplerCompute*>(engine);
-        for (u32 i = 0; i < count; ++i) {
-            if (compute->MayWriteMemory(method + i)) {
-                return true;
-            }
-        }
-        return false;
+        return static_cast<const Engines::KeplerCompute&>(engine).MayWriteMemory(method);
     }
     if (type == Engines::EngineTypes::MaxwellDMA) {
-        for (u32 i = 0; i < count; ++i) {
-            const u32 current = method + i;
-            if (current >= MacroRegistersStart ||
-                (current < engine->execution_mask.size() && engine->execution_mask[current])) {
-                return true;
-            }
-        }
+        return method >= MacroRegistersStart || engine.execution_mask[method];
     }
     return false;
 }
-
-// EDEN_NX2_LIST_CHANGE_TRACE=1: per GPU-written command list address, how often its words differ
-// from the last read of the same address (a wait that only guards unchanged words could go).
-// Logged every 2 s with the first words of each list.
-class ListChangeTrace {
-public:
-    static ListChangeTrace* Get() {
-        static const bool enabled = std::getenv("EDEN_NX2_LIST_CHANGE_TRACE") != nullptr;
-        static ListChangeTrace trace;
-        return enabled ? &trace : nullptr;
+namespace {
+// Host methods that can write guest memory without noting it themselves.
+bool PullerMethodWritesMemory(u32 method) {
+    switch (static_cast<BufferMethods>(method)) {
+    case BufferMethods::BindObject:
+    case BufferMethods::Nop:
+    case BufferMethods::SemaphoreAddressHigh:
+    case BufferMethods::SemaphoreAddressLow:
+    case BufferMethods::SemaphoreSequencePayload:
+    case BufferMethods::SemaphoreOperation: // Releases note their own writes (Puller)
+    case BufferMethods::SemaphoreRelease:
+    case BufferMethods::NonStallInterrupt:
+    case BufferMethods::WrcacheFlush:
+    case BufferMethods::MemOpA:
+    case BufferMethods::MemOpB:
+    case BufferMethods::MemOpC:
+    case BufferMethods::MemOpD:
+    case BufferMethods::RefCnt:
+    case BufferMethods::SemaphoreAcquire: // Ampere: SEM_PAYLOAD_HI, like 0x17..0x19
+    case BufferMethods::SyncpointPayload:
+    case BufferMethods::SyncpointOperation:
+    case BufferMethods::WaitForIdle:
+    case BufferMethods::Yield:
+        return false;
+    default:
+        return !(method >= 0x17 && method <= 0x19);
     }
-
-    void Note(GPUVAddr address, std::span<const CommandHeader> words, u32 method, u32 subchannel,
-              u32 method_count, u32 engine) {
-        Entry& entry = entries[address];
-        ++entry.reads;
-        entry.method = method;
-        entry.subchannel = subchannel;
-        entry.method_count = method_count;
-        entry.engine = engine;
-        std::vector<u32> now(words.size());
-        std::memcpy(now.data(), words.data(), words.size() * sizeof(u32));
-        if (!entry.last.empty()) {
-            if (entry.last != now) {
-                ++entry.changed;
-                u32 differing = 0;
-                for (size_t i = 0; i < (std::min)(now.size(), entry.last.size()); ++i) {
-                    differing += now[i] != entry.last[i] ? 1 : 0;
-                }
-                entry.differing_words += differing + static_cast<u32>(
-                    now.size() > entry.last.size() ? now.size() - entry.last.size()
-                                                   : entry.last.size() - now.size());
-            }
-        }
-        entry.last = std::move(now);
-        const auto clock = std::chrono::steady_clock::now();
-        if (clock - last_log < std::chrono::seconds{2}) {
-            return;
-        }
-        last_log = clock;
-        for (auto& [key, value] : entries) {
-            if (value.reads == 0) {
-                continue;
-            }
-            std::string head;
-            for (size_t i = 0; i < (std::min<size_t>)(value.last.size(), 24); ++i) {
-                head += fmt::format(" {:08x}", value.last[i]);
-            }
-            LOG_INFO(HW_GPU,
-                     "List {:#x}: {} words, {} reads, {} changed ({} words differ in all); pending "
-                     "method {:#x} x{} on sub {} (engine {:#x});{}",
-                     key, value.last.size(), value.reads, value.changed, value.differing_words,
-                     value.method, value.method_count, value.subchannel, value.engine, head);
-            value.reads = 0;
-            value.changed = 0;
-            value.differing_words = 0;
-        }
-    }
-
-private:
-    struct Entry {
-        u64 reads{};
-        u64 changed{};
-        u64 differing_words{};
-        u32 method{};
-        u32 subchannel{};
-        u32 method_count{};
-        u32 engine{};
-        std::vector<u32> last;
-    };
-    std::unordered_map<GPUVAddr, Entry> entries;
-    std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
-};
-} // Anonymous namespace
+}
+} // namespace
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
@@ -157,19 +85,6 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 DmaPusher::~DmaPusher() = default;
 
 void DmaPusher::DispatchCalls() {
-    // EXPERIMENT EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=list: apply the guest's collected CPU writes
-    // before the submitted lists run; they were made before the submit.
-    static const bool invalidate_at_list = [] {
-        const char* value = std::getenv("EDEN_NX2_INVALIDATE_BEFORE_DISPATCH");
-        return value != nullptr && std::string_view{value} == "list";
-    }();
-    if (invalidate_at_list) {
-        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
-        } else {
-            system.GPU().InvalidateGPUCache();
-        }
-    }
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
     while (system.IsPoweredOn()) {
@@ -178,13 +93,10 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        // Submits and releases signaled fences: their writes belong to the entries that queued them.
-        split.Defer(
-            [gpu = &system.GPU()] {
-                gpu->FlushCommands();
-                gpu->OnCommandListEnd();
-            },
-            VideoCommon::GpuSplit::Effect::None);
+        split.Defer([gpu = &system.GPU()] {
+            gpu->FlushCommands();
+            gpu->OnCommandListEnd();
+        });
         split.Publish();
         return;
     }
@@ -271,12 +183,10 @@ bool DmaPusher::Step() {
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
-                    split.Defer(
-                        [engine_state, memory = &memory_manager,
-                         address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
-                            engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                        },
-                        VideoCommon::GpuSplit::Effect::None);
+                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
+                                 bytes = words * sizeof(u32)] {
+                        engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
+                    });
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -317,35 +227,12 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        // EDEN_NX2_LIST_WAIT_SKIP=1 (experiment): no wait for queued compute and copies before
-        // reading a list on pages no GPU work has written yet. The wait only catches the first
-        // GPU write to a page (the bits stay set); the back checks, at the list's place, whether
-        // that happened and logs each list the skip read stale.
-        static const bool skip_list_wait = [] {
-            const char* const value = std::getenv("EDEN_NX2_LIST_WAIT_SKIP");
-            return value != nullptr && value[0] == '1';
-        }();
+        // Recheck even when the wait returns at once: a writer may have finished (and marked the
+        // pages) since the check above.
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
-            auto& split = VideoCommon::GpuSplit::Get();
-            if (skip_list_wait) {
-                split.Defer([this, address = GPUVAddr{dma_state.dma_get},
-                             size = size_t{header.size} * sizeof(u32)] {
-                    if (IsGpuWrittenCommands(address, size)) {
-                        static std::atomic<u32> missed{};
-                        const u32 count = ++missed;
-                        if (count <= 32 || (count & (count - 1)) == 0) {
-                            LOG_WARNING(HW_GPU,
-                                        "EDEN_NX2_LIST_WAIT_SKIP: command list at {:#x} ({} bytes) "
-                                        "was GPU-written by work queued before it ({} so far)",
-                                        address, size, count);
-                        }
-                    }
-                });
-            } else if (!SkipWriterWait(u64{header.size} * sizeof(u32)) &&
-                       split.WaitForWriters()) {
-                gpu_written =
-                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            }
+            VideoCommon::GpuSplit::Get().WaitForWriters();
+            gpu_written =
+                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
@@ -374,52 +261,8 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (gpu_written && command_resume_offset == 0 && header.size == 3 &&
-                   dma_state.method_count == 3 && dma_state.method >= MacroRegistersStart &&
-                   subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerCompute &&
-                   VideoCommon::GpuSplit::Get().Active() && Nx2IndirectGrid::Enabled()) {
-            // A compute macro's (x, y, z) written by GPU work: placeholders the back resolves
-            // on the GPU instead of waiting for it here (nx2_indirect_grid.h).
-            const u32 slot = Nx2IndirectGrid::Reserve(dma_state.dma_get);
-            if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 24) {
-                LOG_INFO(HW_GPU, "GPU-sized dispatch: macro {:#x} on ch {} from {:#x} (slot {})",
-                         dma_state.method, channel_state.bind_id, dma_state.dma_get, slot);
-            }
-            command_headers.resize_destructive(3);
-            for (u32 k = 0; k < 3; ++k) {
-                command_headers[k].argument = Nx2IndirectGrid::Placeholder(slot, k);
-            }
-            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            RecordParsedEntry(header, commands);
-            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
-            command_resume_offset += ProcessCommands(commands, 0);
-        } else if (gpu_written && command_resume_offset == 0 && header.size == 2 &&
-                   dma_state.method_count == 2 && dma_state.method >= MacroRegistersStart &&
-                   subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
-                   VideoCommon::GpuSplit::Get().Active() && Nx2IndirectGrid::DrawsEnabled() &&
-                   static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel])
-                       ->FrontMacroCountsDraw(system, VideoCommon::GpuSplit::Get(),
-                                              dma_state.method, 2)) {
-            // A 3D macro's (count, unused) written by GPU work, which the macro copies into the
-            // draw's vertex count: the back draws with the GPU's count (nx2_indirect_grid.h).
-            const u32 slot = Nx2IndirectGrid::Reserve(dma_state.dma_get);
-            command_headers.resize_destructive(2);
-            for (u32 k = 0; k < 2; ++k) {
-                command_headers[k].argument = Nx2IndirectGrid::DrawPlaceholder(slot, k);
-            }
-            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            RecordParsedEntry(header, commands);
-            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
-            command_resume_offset += ProcessCommands(commands, 0);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            if (ListChangeTrace* const trace = ListChangeTrace::Get()) [[unlikely]] {
-                const u32 sub = dma_state.subchannel;
-                trace->Note(dma_state.dma_get, commands, dma_state.method, sub,
-                            dma_state.method_count,
-                            sub < subchannel_type.size() ? static_cast<u32>(subchannel_type[sub])
-                                                         : ~0U);
-            }
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
             command_resume_offset +=
@@ -483,11 +326,7 @@ static const u32 g_semaphore_watch = [] {
 }();
 
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
-// Read on first use: nx2_switches.txt is applied in main(), after static initialisation.
-static bool RecordParsedEntries() {
-    static const bool record = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
-    return record;
-}
+static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
@@ -655,6 +494,9 @@ void DmaPusher::CallMethod(u32 argument) {
             dma_state.subchannel,
             dma_state.method_count,
         });
+        if (PullerMethodWritesMemory(dma_state.method)) {
+            split.NoteMemoryBarrier(0x10000 | dma_state.method);
+        }
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
@@ -663,20 +505,17 @@ void DmaPusher::CallMethod(u32 argument) {
         }
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = split.Active() &&
-                            WritesMemory(subchannel, engine_type, dma_state.method, 1);
-        // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
-        const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
-                                    engine_type == Engines::EngineTypes::Fermi2D
-                                ? VideoCommon::GpuSplit::Effect::Gpu
-                                : VideoCommon::GpuSplit::Effect::Unknown;
-        const bool memory_writer = split.Active() &&
-                                   (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                    engine_type == Engines::EngineTypes::Fermi2D);
+                            IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        // Other engines' memory writes are not tracked by address (Maxwell3D::FrontDmaRead).
+        const bool untracked_writes = engine_type != Engines::EngineTypes::Maxwell3D &&
+                                      engine_type != Engines::EngineTypes::KeplerCompute &&
+                                      engine_type != Engines::EngineTypes::MaxwellDMA;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
-            } else if (memory_writer) {
-                split.NoteUnrangedWriter();
+            } else if (untracked_writes) {
+                split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
+                                        (dma_state.method & 0xfff));
             }
         };
         if (split.Active()) {
@@ -700,7 +539,7 @@ void DmaPusher::CallMethod(u32 argument) {
                 }
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
-                         WantsSegment() ? &segment : nullptr, effect);
+                         WantsSegment() ? &segment : nullptr);
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -723,6 +562,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (dma_state.method < non_puller_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
+        for (u32 i = 0; i < num_methods; ++i) {
+            if (PullerMethodWritesMemory(dma_state.method + (dma_state.non_incrementing ? 0 : i))) {
+                split.NoteMemoryBarrier(0x10000 | dma_state.method);
+                break;
+            }
+        }
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
@@ -731,21 +576,17 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         }
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = split.Active() &&
-                            WritesMemory(subchannel, engine_type, dma_state.method,
-                                         dma_state.non_incrementing ? 1 : num_methods);
-        // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
-        const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
-                                    engine_type == Engines::EngineTypes::Fermi2D
-                                ? VideoCommon::GpuSplit::Effect::Gpu
-                                : VideoCommon::GpuSplit::Effect::Unknown;
-        const bool memory_writer = split.Active() &&
-                                   (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                    engine_type == Engines::EngineTypes::Fermi2D);
+                            IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        // Other engines' memory writes are not tracked by address (Maxwell3D::FrontDmaRead).
+        const bool untracked_writes = engine_type != Engines::EngineTypes::Maxwell3D &&
+                                      engine_type != Engines::EngineTypes::KeplerCompute &&
+                                      engine_type != Engines::EngineTypes::MaxwellDMA;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
-            } else if (memory_writer) {
-                split.NoteUnrangedWriter();
+            } else if (untracked_writes) {
+                split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
+                                        (dma_state.method & 0xfff));
             }
         };
         if (split.Active()) {
@@ -769,7 +610,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 }
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
-                              dma_state.method_count, WantsSegment() ? &segment : nullptr, effect);
+                              dma_state.method_count, WantsSegment() ? &segment : nullptr);
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
@@ -807,48 +648,6 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
                                        entry.size * sizeof(u32));
     }
     list.deferred_entries.clear();
-}
-
-bool DmaPusher::SkipWriterWait(u64 size) {
-    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_list_fast, "EDEN_NX2_LIST_FAST");
-    if (mode == 0) {
-        return false;
-    }
-    // The wait only finds a list page a queued dispatch or copy writes for the first time: once
-    // no page has been newly written for a while, the set of written pages is taken as settled.
-    const u64 marks = Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed);
-    const auto now = std::chrono::steady_clock::now();
-    if (marks != list_fast_marks) {
-        list_fast_marks = marks;
-        list_fast_since = now;
-        return false;
-    }
-    if (now - list_fast_since < std::chrono::seconds{2}) {
-        return false;
-    }
-    if (mode == 2) {
-        const GPUVAddr address = dma_state.dma_get;
-        auto* const memory = &memory_manager;
-        VideoCommon::GpuSplit::Get().Defer([memory, address, size] {
-            static std::atomic<u64> checks{};
-            static std::atomic<u64> misses{};
-            bool written = false;
-            for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size;
-                 page += 0x1000) {
-                const auto device = memory->GpuToCpuAddress(page);
-                written |= device && Tegra::Nx2IsGpuWritten(*device);
-            }
-            const u64 count = checks.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (written && misses.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(HW_GPU, "List fast check: entry at {:#x} became GPU-written", address);
-            }
-            if ((count & 0xffff) == 0) {
-                LOG_INFO(HW_GPU, "List fast check: {} entries, {} misses", count,
-                         misses.load(std::memory_order_relaxed));
-            }
-        });
-    }
-    return true;
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
@@ -973,14 +772,7 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                                     VideoCommon::CacheType::BufferCache);
-    // The other pages draws wrote since their last flush go along in the same GPU round trip:
-    // their next lists then read guest memory instead of draining and flushing again.
-    // EDEN_NX2_CMDPAGE_BATCH=0 flushes this entry's pages only, as before.
-    static const bool batch = [] {
-        const char* value = std::getenv("EDEN_NX2_CMDPAGE_BATCH");
-        return value == nullptr || std::string_view{value} != "0";
-    }();
-    if (batch && rasterizer != nullptr) {
+    if (rasterizer != nullptr) {
         std::vector<DAddr> pages;
         for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
             if (const auto device = memory_manager.GpuToCpuAddress(page)) {
@@ -988,8 +780,8 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             }
         }
         VideoCommon::GpuSplit::Get().Run(
-            [rasterizer = rasterizer, pages = &pages] {
-                rasterizer->FlushGpuWrittenCommandListPages(*pages);
+            [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
+                rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
             VideoCommon::DrainSite::ListFlush);
     } else if (dirty) {
@@ -1072,7 +864,7 @@ void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash
 
 void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
                                   std::span<const CommandHeader> commands) {
-    if (!RecordParsedEntries()) {
+    if (!g_record_parsed_entries) {
         return;
     }
     u64 hash = 0xcbf29ce484222325ULL;
