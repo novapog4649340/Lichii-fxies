@@ -137,9 +137,10 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: .cache/cpm
-          key: cpm-windows-clangcl-v1-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          # Its own key: this line patches sirit (.patch/sirit), and main's downloads are unpatched.
+          key: cpm-windows-clangcl-conongnang-v1-${{ hashFiles('cpmfile.json', '.patch/**', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
           restore-keys: |
-            cpm-windows-clangcl-v1-
+            cpm-windows-clangcl-conongnang-v1-
 
       # The profile's hash is part of the key, so objects built against another profile are
       # never restored.
@@ -154,7 +155,8 @@ jobs:
             objects-windows-clangcl-${{ hashFiles('lichii-windows.profdata') }}-v1-
 
       # A profile older than the source only warns: functions changed since training lose their
-      # profile data and are optimized as in a plain ThinLTO build.
+      # profile data and are optimized as in a plain ThinLTO build. sirit is built from source:
+      # the bundled one MSVC-style builds download by default lacks .patch/sirit (OpAtomicFAddEXT).
       - name: Configure
         shell: bash
         run: |
@@ -172,6 +174,7 @@ jobs:
             -DYUZU_ROOM_STANDALONE=OFF \
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_SIRIT=OFF \
             -DENABLE_UPDATE_CHECKER=OFF \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=windows-x86_64-pgo \
