@@ -665,21 +665,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        // A readable word has no pending fence that writes it (SemaphoreReadableNow), so the
-        // fences are released in order on the back instead of after a drain; a release among them
-        // that meets the value still latches the waiter. Drained, these kept the front waiting
-        // ~200 ms a second in Ocarina's Kokiri Forest (1,245 a second on an RX 9060 XT).
-        // EDEN_NX2_ACQUIRE_FENCE_DRAIN=1 restores the drain.
-        static const bool drain_readable = [] {
-            const char* value = std::getenv("EDEN_NX2_ACQUIRE_FENCE_DRAIN");
-            return value != nullptr && value[0] == '1';
-        }();
-        if (readable && !drain_readable) {
-            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
-            VideoCommon::GpuSplit::Get().NoteSync();
-        } else {
-            ReleaseFences(dma_pusher);
-        }
+        ReleaseFences(dma_pusher);
         const bool met_now = readable
                                  ? (SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
                                     acquire.Matches(word))
