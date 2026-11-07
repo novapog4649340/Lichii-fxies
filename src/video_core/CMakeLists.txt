@@ -452,6 +452,10 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+if (WIN32)
+    # The host frame pacer reads the compositor's timing (renderer_vulkan/vk_host_pacer.cpp).
+    target_link_libraries(video_core PRIVATE dwmapi)
+endif()
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()
