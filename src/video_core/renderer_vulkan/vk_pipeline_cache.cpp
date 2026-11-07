@@ -1295,6 +1295,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
+            if (!pipeline) {
+                std::scoped_lock failed_lock{failed_disk_mutex};
+                failed_disk_pipelines.insert(key.Hash());
+            }
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1351,6 +1355,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         env_ptrs.push_back(&env);
                     }
                     pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+                    if (!pipeline) {
+                        std::scoped_lock failed_lock{failed_disk_mutex};
+                        failed_disk_pipelines.insert(key.Hash());
+                    }
                 }
                 std::unique_lock lock{background_mutex};
                 if (pipeline && !background_claimed.contains(key)) {
@@ -1921,12 +1929,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    if (disk_pipelines.contains(graphics_key.Hash())) {
-        // In the disk cache already, only not built at boot.
-        QueueVulkanPipelineCacheFlush();
-        return pipeline;
+    const u64 hash = graphics_key.Hash();
+    if (disk_pipelines.contains(hash)) {
+        bool failed_on_disk;
+        {
+            std::scoped_lock lock{failed_disk_mutex};
+            failed_on_disk = failed_disk_pipelines.erase(hash) != 0;
+        }
+        if (!failed_on_disk) {
+            // In the disk cache already, only not built at boot.
+            QueueVulkanPipelineCacheFlush();
+            return pipeline;
+        }
+        // Its record failed to build from the file, so every session translated it again on
+        // the GPU thread (Ocarina of Time: ~1,900 records copied from an earlier build's cache).
+        // This build's record goes after it; the next boot builds that one.
     }
-    disk_pipelines.insert(graphics_key.Hash());
+    disk_pipelines.insert(hash);
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
