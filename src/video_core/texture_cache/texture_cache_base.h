@@ -239,6 +239,9 @@ public:
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
+    // Publish the CPU-readable collision image. Caller holds the cache mutex.
+    bool PublishComputeCollisionImage(u32 index);
+
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
 
@@ -280,6 +283,16 @@ public:
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
     }
+
+    /// A clear of the bound render targets (UpdateRenderTargets(true) first): records the frame
+    /// on the images it fully clears.
+    void NoteRenderTargetsCleared(bool color, bool depth);
+
+    /// Whether the bound render targets are redrawn every frame (all fully cleared in this frame
+    /// and the one before), so a draw into them may be skipped once: 0 when they are, 1 none bound,
+    /// 2 one was not fully cleared in this frame, 3 one was cleared in this frame but not the one
+    /// before (for the runtime pipeline log).
+    [[nodiscard]] int RenderTargetsRedrawnReason();
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
@@ -469,6 +482,9 @@ private:
 
     /// Unregister image from the page table
     void UnregisterImage(ImageId image);
+
+    /// Logs where UnregisterImage's image was registered when one of its pages is missing.
+    void ReportMissingImagePage(ImageId image_id, const Image& image, u64 page);
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageBase& image, ImageId image_id);

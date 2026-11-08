@@ -117,8 +117,14 @@ struct ImageBase {
     std::vector<std::pair<u64, u64>> dirty_ranges;
     u64 scale_tick = 0;
     bool has_scaled = false;
+    /// Frames (TextureCache frame ticks) of the last two that fully cleared this image as a
+    /// render target: one cleared in both this frame and the one before is redrawn every frame.
+    u64 clear_frame = ~u64{0};
+    u64 previous_clear_frame = ~u64{0};
 
+    /// The channel and GPU address space whose page table RegisterImage put the image in.
     size_t channel = 0;
+    size_t address_space = 0;
 
     ImageFlagBits flags = ImageFlagBits::CpuModified;
 

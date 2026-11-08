@@ -111,6 +111,7 @@ add_library(video_core STATIC
     memory_manager.cpp
     memory_manager.h
     page_filter.h
+    pipeline_cache_policy.h
     native_qmd.h
     native_query_trace.h
     nx2.h
@@ -192,8 +193,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
+    renderer_vulkan/vk_ocarina_camera_motion.cpp
+    renderer_vulkan/vk_ocarina_camera_motion.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
+    renderer_vulkan/vk_cooperative_hmma_test.cpp
+    renderer_vulkan/vk_cooperative_hmma_test.h
     renderer_vulkan/vk_descriptor_buffer.cpp
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
@@ -250,6 +255,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_instance.h
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
+    vulkan_common/vulkan_overlay_filter.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
@@ -269,6 +275,12 @@ add_library(video_core STATIC
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
+    shader_warm/shader_archives.cpp
+    shader_warm/shader_archives.h
+    shader_warm/shader_warm_builder.cpp
+    shader_warm/shader_warm_builder.h
+    shader_warm/warm_records.cpp
+    shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
@@ -284,6 +296,7 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
     texture_cache/image_view_base.cpp
@@ -454,6 +467,12 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(video_core PUBLIC common core)
+if(WIN32)
+    target_link_libraries(video_core PRIVATE advapi32)
+endif()
+
+# Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
+target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)

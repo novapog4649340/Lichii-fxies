@@ -211,6 +211,21 @@ json Status(ToolState& state, const json& params) {
 json FrameTimes(ToolState& state, const json& params) {
     const double seconds = params.value("seconds", 5.0);
     const double refresh_hz = params.value("refresh_hz", 60.0);
+    // past: the last `past` seconds of presents already made, without waiting (the ring keeps
+    // the last 4096).
+    if (const double past = params.value("past", 0.0); past > 0.0) {
+        if (!std::isfinite(past) || past > 600.0) {
+            throw std::runtime_error{"past must be > 0 and <= 600"};
+        }
+        const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
+        const u64 capacity = g_nx2_present_times_ns.size();
+        const auto now = std::chrono::steady_clock::now();
+        const u64 end_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        const u64 begin_ns = end_ns - static_cast<u64>(past * 1e9);
+        return ReadFrameTimes(after > capacity - 1 ? after - (capacity - 1) : 0, after, begin_ns,
+                              end_ns, refresh_hz);
+    }
     if (!std::isfinite(seconds) || seconds <= 0.0 || seconds > 60.0 ||
         !std::isfinite(refresh_hz) || refresh_hz <= 0.0) {
         throw std::runtime_error{"seconds must be > 0 and <= 60; refresh_hz must be > 0"};
@@ -278,6 +293,17 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
     const double median = percentile(0.5);
     std::array<size_t, 4> buckets{};
     size_t stutters = 0;
+    // Hitches: intervals over 50 ms, over the whole window (intervals_ms keeps only the last 120).
+    size_t hitches = 0;
+    double hitch_ms = 0.0;
+    json worst = json::array();
+    for (size_t i = frames; i-- > 0 && intervals[i] > 50.0;) {
+        ++hitches;
+        hitch_ms += intervals[i];
+        if (worst.size() < 8) {
+            worst.push_back(std::round(intervals[i]));
+        }
+    }
     for (const double interval : intervals) {
         const double periods = interval * refresh_hz / 1000.0;
         ++buckets[periods < 1.5 ? 0 : periods < 2.5 ? 1 : periods < 3.5 ? 2 : 3];
@@ -296,6 +322,9 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
             {"min_ms", frames == 0 ? 0.0 : intervals.front()},
             {"vsync_buckets", {{"1", share(0)}, {"2", share(1)}, {"3", share(2)}, {"4+", share(3)}}},
             {"stutters", stutters},
+            {"hitches", hitches},
+            {"hitch_ms", std::round(hitch_ms)},
+            {"worst_ms", std::move(worst)},
             {"intervals_ms", std::move(recent)},
             {"truncated", truncated}};
 }
@@ -484,6 +513,16 @@ json SampleThreads(ToolState& state, const json& params) {
     std::string report = Nx2Sampler::Sample(threads.c_str(), seconds, path.string());
     report.resize((std::min)(report.size(), Param<size_t>(params, "max_chars", 60000, 0, 4000000)));
     return {{"file", path.generic_string()}, {"report", std::move(report)}};
+}
+
+// Lifts or restores the speed limit (test scripts boot through the logos and menus unlimited).
+json SpeedLimit(ToolState&, const json& params) {
+    auto& setting = Settings::values.use_speed_limit;
+    const bool previous = setting.GetValue();
+    if (params.contains("on")) {
+        setting.SetValue(params.at("on").get<bool>());
+    }
+    return {{"previous", previous}, {"on", setting.GetValue()}};
 }
 
 json ReadMemory(ToolState& state, const json& params) {
@@ -680,6 +719,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
+        {"speed_limit", handler(SpeedLimit)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
