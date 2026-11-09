@@ -538,35 +538,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download binaries
+      # By name, not pattern: with a single artifact, a pattern download unpacks its files
+      # straight into the path and the packaging loop below zips the Qt plugin folders instead
+      # of the build (build-8).
+      - name: Download binary
         uses: actions/download-artifact@v7
         with:
-          pattern: lichii-*-${{ github.sha }}
-          path: artifacts
+          name: lichii-windows-x86_64-pgo-${{ github.sha }}
+          path: artifacts/lichii-windows-x86_64-pgo
 
-      - name: Package release files
+      - name: Package release file
         shell: bash
         run: |
           set -euo pipefail
           mkdir dist
-          # Asset names drop the commit sha: the release tag already identifies the build, and
-          # stable names let the notes table link to them.
-          strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          for artifact in artifacts/*/; do
-            name=$(basename "$artifact")
-            if compgen -G "$artifact*.AppImage" > /dev/null; then
-              # Linux: ship the AppImage and the tar.gz as they are.
-              for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
-                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            elif compgen -G "$artifact*.zip" > /dev/null; then
-              for file in "$artifact"*.zip "$artifact"*.dmg; do
-                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
-            fi
-          done
+          test -f artifacts/lichii-windows-x86_64-pgo/lichii.exe
+          (cd artifacts/lichii-windows-x86_64-pgo && \
+            zip -qr "${GITHUB_WORKSPACE}/dist/lichii-windows-x86_64-pgo.zip" .)
           ls -la dist
 
       - name: Create release
@@ -583,62 +571,17 @@ jobs:
           tag="build-${GITHUB_RUN_NUMBER}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
-          link() { [[ -e "dist/$2" ]] && echo "[$1](${base}/$2)" || true; }
-          appimage_tar() {
-            local appimage tar
-            appimage=$(link AppImage "$1.AppImage")
-            tar=$(link tar.gz "$1.tar.gz")
-            echo "${appimage}${appimage:+${tar:+ · }}${tar}"
-          }
-          has_pgo=$(compgen -G 'dist/*-pgo.*' || true)
-          row() {
-            [[ -z "$2$3" ]] && return 0
-            if [[ -n "$has_pgo" ]]; then echo "| $1 | $2 | $3 | $4 |"; else echo "| $1 | $2 | $4 |"; fi
-          }
-          table() {
-            local rows
-            rows=$(cat)
-            [[ -z "$rows" ]] && return 0
-            if [[ -n "$has_pgo" ]]; then
-              printf '| Build Type | Standard | PGO (Recommended) | Notes |\n| --- | --- | --- | --- |\n'
-            else
-              printf '| Build Type | Standard | Notes |\n| --- | --- | --- |\n'
-            fi
-            echo "$rows"
-          }
-          pgo_note=""
-          if [[ -n "$has_pgo" ]]; then
-            pgo_note="The PGO builds are the same programs compiled with profile-guided optimization. Linux uses clang with Eglantine's profile; Windows uses clang-cl and ThinLTO with a profile trained in Lichii on Ocarina of Time, so other games gain less. Prefer them when your CPU supports it."
-          fi
-
           cat > notes.md <<EOF
           Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
 
+          This fork builds only the Windows x86_64 PGO zip (clang-cl, ThinLTO, a profile trained
+          on Ocarina of Time). Extract it and run \`lichii.exe\`. The update checker is off, so it
+          will not offer upstream releases over this build.
+
+          [lichii-windows-x86_64-pgo.zip](${base}/lichii-windows-x86_64-pgo.zip)
+
           > [!TIP]
           > **Ocarina of Time above 60 fps:** press **Ctrl+U** (the Toggle Framerate Limit hotkey) to unlock the frame rate, or set **Frame rate limit (Switch 2)** under the game's Properties > Graphics (e.g. 120; applies when the game starts) to cap it there. The **FPS Unlock (built-in)** add-on, on by default, keeps animations and physics at normal speed at any frame rate; leave it enabled.
-
-          ## Linux
-
-          Linux packages come as an AppImage (self-contained, needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch) and a tar.gz (uses your system libraries, so Qt 6 and the usual libraries must be installed).
-
-          $({
-            row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
-          } | table)
-
-          ## Windows
-
-          Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
-
-          $({
-            row "amd64 / x86_64" "$(link zip lichii-windows-x86_64.zip)" "$(link "PGO zip" lichii-windows-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
-          } | table)
-
-          ## macOS
-
-          $(row "arm64 (Apple Silicon)" "$(link zip lichii-macos-arm64.zip)" "" "macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\`" | table)
-
-          ${pgo_note}
           EOF
 
           gh release create "${tag}" dist/* \
